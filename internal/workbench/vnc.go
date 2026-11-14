@@ -101,12 +101,17 @@ func (s *Server) streamVNC(w http.ResponseWriter, r *http.Request, reader io.Rea
 		for {
 			n, e := reader.Read(b)
 			if n > 0 {
-				_ = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if ws.WriteMessage(websocket.BinaryMessage, b[:n]) != nil {
+				// A software-rendered guest can fall behind a busy viewer for several
+				// seconds. Sixty seconds keeps a slow frame from tearing down a health
+				// display, while still bounding a genuinely dead client.
+				_ = ws.SetWriteDeadline(time.Now().Add(60 * time.Second))
+				if err := ws.WriteMessage(websocket.BinaryMessage, b[:n]); err != nil {
+					diagnostics.Log("warn", "display-transport", "frame write failed: "+err.Error())
 					return
 				}
 			}
 			if e != nil {
+				diagnostics.Log("debug", "display-transport", "guest stream ended: "+e.Error())
 				return
 			}
 		}
@@ -114,6 +119,7 @@ func (s *Server) streamVNC(w http.ResponseWriter, r *http.Request, reader io.Rea
 	for {
 		kind, b, e := ws.ReadMessage()
 		if e != nil {
+			diagnostics.Log("debug", "display-transport", "viewer closed: "+e.Error())
 			return
 		}
 		if kind == websocket.BinaryMessage {
