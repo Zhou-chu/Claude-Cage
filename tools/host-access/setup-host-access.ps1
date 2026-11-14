@@ -1,4 +1,4 @@
-# Cage 宿主机访问配置（B 方案：专用标准用户 cageops）
+﻿# Cage 宿主机访问配置（B 方案：专用标准用户 cageops）
 #
 # 用途：允许 Cage 客机通过 Tailscale 以标准用户身份 SSH 到宿主机，
 #       并为「审批代理」放行本机端口与开机自启。
@@ -114,7 +114,7 @@ if ($content -match '(?m)^\s*AllowUsers\s') {
     Write-Host 'sshd_config 已有 AllowUsers，本脚本不覆盖，请手工确认其中包含：' -ForegroundColor Yellow
     Write-Host "    $allowLine" -ForegroundColor Yellow
 } else {
-    $entry = "`r`n# Cage: 客机以专用标准用户、仅从固定 tailnet 地址登录；其余账号保持原样`r`nAllowUsers $allowLine`r`n"
+    $entry = "`r`n# Cage: dedicated standard user from a fixed tailnet address only`r`nAllowUsers $allowLine`r`n"
     Add-Content -Path $sshdConfig -Value $entry -Encoding ascii
     Write-Host "已添加 AllowUsers $UserName@$GuestAddress"
 }
