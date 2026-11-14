@@ -69,7 +69,7 @@ Wants=cage-display-governor.service
 [Service]
 User=cage-browser
 ExecStartPre=/usr/bin/rm -f /home/cage-browser/.vnc/display.sock
-ExecStart=/usr/local/bin/cage-log-run /usr/bin/Xtigervnc :77 -geometry 2880x1800 -depth 24 -rfbport -1 -rfbunixpath /home/cage-browser/.vnc/display.sock -rfbunixmode 0600 -nolisten tcp -localhost -SecurityTypes VncAuth -PasswordFile /home/cage-browser/.vnc/passwd
+ExecStart=/usr/local/bin/cage-log-run /usr/bin/Xtigervnc :77 -geometry 1920x1080 -depth 24 -rfbport -1 -rfbunixpath /home/cage-browser/.vnc/display.sock -rfbunixmode 0600 -nolisten tcp -localhost -SecurityTypes VncAuth -PasswordFile /home/cage-browser/.vnc/passwd
 LogNamespace=cage
 Restart=on-failure
 UNIT
