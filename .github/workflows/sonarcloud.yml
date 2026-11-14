@@ -1,0 +1,39 @@
+name: SonarCloud
+
+# 代码质量门禁。需要先在仓库设置里配置：
+#   Secret  SONAR_TOKEN  —— SonarCloud 项目令牌
+#   Variable SONAR_ENABLED = true —— 未配置时本 workflow 跳过，不阻塞其它 CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  sonarcloud:
+    name: 静态分析与覆盖率
+    if: ${{ vars.SONAR_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 关闭浅克隆，Sonar 需要完整历史来判定新增代码
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 生成覆盖率
+        # 覆盖率采集失败不应中断分析；Sonar 会以 0% 呈现并单独报警
+        run: go test -coverprofile=coverage.out -covermode=atomic ./... || true
+
+      - name: SonarCloud 扫描
+        uses: SonarSource/sonarqube-scan-action@v5
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
