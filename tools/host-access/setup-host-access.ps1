@@ -3,10 +3,12 @@
 # 以管理员身份运行：
 #   powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-host-access.ps1
 #
-# 本脚本刻意不依赖 LocalAccounts / NetSecurity 等可选模块：
-#   账号   → net user + ADSI
-#   防火墙 → netsh advfirewall
-# 这样在 32 位 PowerShell 或模块路径异常的环境里也能跑。
+# 两个环境适配要点（都是实测踩过的坑）：
+#   1. 若当前是 32 位 PowerShell，脚本会自动改用 64 位重新启动自己：
+#      32 位进程访问 System32 会被重定向到 SysWOW64，拿不到 sshd.exe；
+#   2. 原生程序（net/netsh/icacls）写 stderr 时，在 ErrorActionPreference=Stop 下
+#      PowerShell 5.1 会抛 NativeCommandError。而「用户不存在」正是正常的探测路径，
+#      所以所有原生命令统一经 Invoke-Native 调用，避免误判为致命错误。
 
 [CmdletBinding()]
 param(
@@ -14,10 +16,25 @@ param(
     [string]$GuestAddress = '100.65.250.76',
     [string]$UserName = 'cageops',
     [string]$AlsoAllowUsers = 'Zhouchu',
-    [int]$BrokerPort = 8642
+    [int]$BrokerPort = 8642,
+    # 内部使用：避免 64 位自重启后再次进入同一分支
+    [switch]$AlreadyRelaunched
 )
 
 $ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------- 0. 位数适配
+if (-not [Environment]::Is64BitProcess -and -not $AlreadyRelaunched) {
+    # Sysnative 只在 32 位进程里存在，指向真正的 System32
+    $x64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path $x64)) {
+        $x64 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    }
+    Write-Host '检测到 32 位 PowerShell，正在以 64 位重新启动…' -ForegroundColor Yellow
+    $forward = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-AlreadyRelaunched')
+    & $x64 @forward
+    exit $LASTEXITCODE
+}
 
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -27,11 +44,21 @@ if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([S
 Write-Host '== Cage 宿主机访问配置 ==' -ForegroundColor Cyan
 Write-Host ("   PowerShell {0} / 64位进程={1} / 用户={2}" -f $PSVersionTable.PSVersion, [Environment]::Is64BitProcess, $identity.Name) -ForegroundColor DarkGray
 
-function Test-LocalUserExists {
-    param([string]$Name)
-    # net user <name> 在账号不存在时返回退出码 2
-    & net.exe user $Name 2>$null | Out-Null
-    return ($LASTEXITCODE -eq 0)
+# 统一封装：原生程序的退出码才是判定依据，stderr 内容不当作异常
+function Invoke-Native {
+    param([string]$Exe, [string[]]$Arguments)
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = & $Exe @Arguments 2>&1
+        $code = $LASTEXITCODE
+        return [pscustomobject]@{
+            ExitCode = $code
+            Output   = (@($output) | Out-String).Trim()
+        }
+    } finally {
+        $ErrorActionPreference = $previous
+    }
 }
 
 function New-RandomPassword {
@@ -41,12 +68,17 @@ function New-RandomPassword {
 }
 
 # ---------------------------------------------------------------- 1. 账号
-if (Test-LocalUserExists -Name $UserName) {
+$probe = Invoke-Native -Exe 'net.exe' -Arguments @('user', $UserName)
+if ($probe.ExitCode -eq 0) {
     Write-Host "账号 $UserName 已存在，跳过创建（不重置密码）。"
 } else {
     $password = New-RandomPassword
-    & net.exe user $UserName $password /add /expires:never "/comment:Cage guest SSH operator (standard user)" 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "创建账号 $UserName 失败（net user 退出码 $LASTEXITCODE）。" }
+    $created = Invoke-Native -Exe 'net.exe' -Arguments @(
+        'user', $UserName, $password, '/add', '/expires:never',
+        '/comment:Cage guest SSH operator (standard user)')
+    if ($created.ExitCode -ne 0) {
+        throw "创建账号 $UserName 失败（net user 退出码 $($created.ExitCode)）：$($created.Output)"
+    }
     # DONT_EXPIRE_PASSWORD (0x10000)：密码永不过期，避免数月后 SSH 突然失效
     $acct = [ADSI]"WinNT://$env:COMPUTERNAME/$UserName,user"
     $acct.UserFlags.Value = $acct.UserFlags.Value -bor 0x10000
@@ -55,9 +87,9 @@ if (Test-LocalUserExists -Name $UserName) {
 }
 
 # 确保不是管理员：B 方案的意义全在于此
-# 不先判断成员关系——非成员时该命令只会报错退出，避免依赖本地化后的组名解析
-& net.exe localgroup Administrators $UserName /delete 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) {
+# 非成员时该命令只会失败退出，因此不预先解析（也避开本地化组名问题）
+$demote = Invoke-Native -Exe 'net.exe' -Arguments @('localgroup', 'Administrators', $UserName, '/delete')
+if ($demote.ExitCode -eq 0) {
     Write-Host "已从 Administrators 组移除 $UserName。" -ForegroundColor Yellow
 } else {
     Write-Host "$UserName 不在 Administrators 组（符合预期）。"
@@ -70,7 +102,7 @@ if (-not (Test-Path $profileDir)) {
     $dacl = Get-Acl $profileDir
     $dacl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $UserName)))
     Set-Acl -Path $profileDir -AclObject $dacl
-    icacls $profileDir /grant "${UserName}:(OI)(CI)F" /T | Out-Null
+    Invoke-Native -Exe 'icacls.exe' -Arguments @($profileDir, '/grant', "${UserName}:(OI)(CI)F", '/T') | Out-Null
     Write-Host "已创建用户目录 $profileDir。"
 }
 
@@ -86,8 +118,10 @@ if ($current -notcontains $keyLine) {
     Write-Host '客机公钥已存在。'
 }
 
-icacls $sshDir /inheritance:r /grant "${UserName}:(OI)(CI)F" /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' | Out-Null
-icacls $keyFile /inheritance:r /grant "${UserName}:F" /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
+Invoke-Native -Exe 'icacls.exe' -Arguments @($sshDir, '/inheritance:r',
+    '/grant', "${UserName}:(OI)(CI)F", '/grant', 'SYSTEM:(OI)(CI)F', '/grant', 'Administrators:(OI)(CI)F') | Out-Null
+Invoke-Native -Exe 'icacls.exe' -Arguments @($keyFile, '/inheritance:r',
+    '/grant', "${UserName}:F", '/grant', 'SYSTEM:F', '/grant', 'Administrators:F') | Out-Null
 $acl = Get-Acl $keyFile
 $acl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $UserName)))
 Set-Acl -Path $keyFile -AclObject $acl
@@ -113,20 +147,24 @@ if ($content -match '(?m)^\s*AllowUsers\s') {
 }
 
 $sshdExe = Join-Path $env:SystemRoot 'System32\OpenSSH\sshd.exe'
-& $sshdExe -t
-if ($LASTEXITCODE -ne 0) {
+if (-not (Test-Path $sshdExe)) { throw "找不到 $sshdExe，请确认 OpenSSH Server 已安装。" }
+$verify = Invoke-Native -Exe $sshdExe -Arguments @('-t')
+if ($verify.ExitCode -ne 0) {
     Copy-Item $backup $sshdConfig -Force
-    throw 'sshd 配置校验失败，已回滚，未重启服务。'
+    throw "sshd 配置校验失败，已回滚，未重启服务：$($verify.Output)"
 }
 Restart-Service sshd
 Write-Host 'sshd 配置校验通过并已重启。'
 
 # ---------------------------------------------------------------- 4. 防火墙（netsh）
 $ruleName = 'Cage approval broker'
-$show = & netsh.exe advfirewall firewall show rule name="$ruleName" 2>&1 | Out-String
-if ($show -match 'No rules match' -or $show -match '没有与指定条件相匹配的规则') {
-    & netsh.exe advfirewall firewall add rule name="$ruleName" dir=in action=allow protocol=TCP localport=$BrokerPort remoteip=$GuestAddress 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "添加防火墙规则失败（netsh 退出码 $LASTEXITCODE）。" }
+$show = Invoke-Native -Exe 'netsh.exe' -Arguments @('advfirewall', 'firewall', 'show', 'rule', "name=$ruleName")
+$ruleMissing = ($show.ExitCode -ne 0) -or ($show.Output -match 'No rules match') -or ($show.Output -match '没有与指定条件相匹配的规则')
+if ($ruleMissing) {
+    $added = Invoke-Native -Exe 'netsh.exe' -Arguments @(
+        'advfirewall', 'firewall', 'add', 'rule', "name=$ruleName", 'dir=in', 'action=allow',
+        'protocol=TCP', "localport=$BrokerPort", "remoteip=$GuestAddress")
+    if ($added.ExitCode -ne 0) { throw "添加防火墙规则失败：$($added.Output)" }
     Write-Host "已放行 $BrokerPort（仅来源 $GuestAddress）。"
 } else {
     Write-Host "防火墙规则「$ruleName」已存在。"
