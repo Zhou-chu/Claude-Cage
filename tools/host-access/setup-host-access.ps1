@@ -69,7 +69,14 @@ if ($admins -contains "$env:COMPUTERNAME\$UserName") {
 # ---------------------------------------------------------------- 2. 公钥
 $profileDir = Join-Path $env:SystemDrive "Users\$UserName"
 if (-not (Test-Path $profileDir)) {
-    throw "找不到 $profileDir；请先用 SSH 或登录一次以生成用户配置文件，或手工创建该目录。"
+    # 新建账号不会立刻生成用户配置文件目录，但 sshd 以家目录解析 authorized_keys，
+    # 所以这里手工建出来并把所有者交给该用户。
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+    $dacl = Get-Acl $profileDir
+    $dacl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $UserName)))
+    Set-Acl -Path $profileDir -AclObject $dacl
+    icacls $profileDir /grant "${UserName}:(OI)(CI)F" /T | Out-Null
+    Write-Host "已创建用户目录 $profileDir（首次交互登录后 Windows 会补全配置文件）。"
 }
 $sshDir = Join-Path $profileDir '.ssh'
 New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
