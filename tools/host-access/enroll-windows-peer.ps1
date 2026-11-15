@@ -202,6 +202,43 @@ function Restore-PeerDisabledAccount($User, [bool]$Created, [bool]$Resumed) {
     if ($Created -or $Resumed) { Set-PeerAccountEnabled $User $false }
 }
 
+function Get-PeerKeyAclRuleSet([Security.AccessControl.FileSecurity]$Acl) {
+    $raw = New-Object Security.AccessControl.RawSecurityDescriptor($Acl.GetSecurityDescriptorBinaryForm(), 0)
+    if (-not ($raw.ControlFlags -band [Security.AccessControl.ControlFlags]::DiscretionaryAclPresent) -or
+        $null -eq $raw.DiscretionaryAcl) { throw 'Missing/null discretionary ACL.' }
+    $rules = New-Object 'Collections.Generic.List[string]'
+    foreach ($ace in $raw.DiscretionaryAcl) {
+        if ($ace -isnot [Security.AccessControl.CommonAce] -or $ace.IsCallback -or
+            $ace.AceQualifier -ne [Security.AccessControl.AceQualifier]::AccessAllowed -or
+            $ace.AceFlags -ne [Security.AccessControl.AceFlags]::None) {
+            throw 'Only explicit, non-inheriting standard allow entries are permitted.'
+        }
+        $rules.Add(('{0}|{1}' -f $ace.SecurityIdentifier.Value, $ace.AccessMask))
+    }
+    return ,@($rules | Sort-Object)
+}
+function Assert-PeerKeyAcl {
+    param([Security.AccessControl.FileSecurity]$Actual, [Security.AccessControl.FileSecurity]$Expected)
+    try {
+        if ($null -eq $Actual -or $null -eq $Expected) { throw 'Missing security descriptor.' }
+        if (-not $Actual.AreAccessRulesProtected -or -not $Expected.AreAccessRulesProtected) {
+            throw 'DACL inheritance protection is required.'
+        }
+        if ($Actual.GetOwner([Security.Principal.SecurityIdentifier]).Value -cne
+            $Expected.GetOwner([Security.Principal.SecurityIdentifier]).Value) { throw 'Owner SID differs.' }
+        $actualRules = Get-PeerKeyAclRuleSet $Actual
+        $expectedRules = Get-PeerKeyAclRuleSet $Expected
+        if ($expectedRules.Count -ne 3 -or $actualRules.Count -ne $expectedRules.Count) {
+            throw 'Exactly the three intended permission entries are required.'
+        }
+        for ($i = 0; $i -lt $expectedRules.Count; $i++) {
+            if ($actualRules[$i] -cne $expectedRules[$i]) { throw 'Permission SID or access mask differs.' }
+        }
+        # NTFS may set AutoInherited on a protected DACL (D:P becomes D:PAI).
+        # Compare exact access facts, not historical descriptor flags/ACE order.
+    } catch { throw ('Dedicated key ACL verification failed. ' + $_.Exception.Message) }
+}
+
 function Assert-PeerPublicKey([string]$GuestPublicKey) {
     # Exactly one plain public-key line; reject options, CR/LF and controls.
     if ($GuestPublicKey -cnotmatch '\Assh-ed25519 ([A-Za-z0-9+/]+={0,2})(?: [\x20-\x7e]+)?\z') {
@@ -325,9 +362,7 @@ try {
     }
     Set-Acl -LiteralPath $keyFile -AclObject (New-CageKeyAcl $userSid)
     $actual = Get-Acl -LiteralPath $keyFile
-    $expectedAcl = New-CageKeyAcl $userSid
-    $sections = [Security.AccessControl.AccessControlSections]::Owner -bor [Security.AccessControl.AccessControlSections]::Access
-    if ($actual.GetSecurityDescriptorSddlForm($sections) -cne $expectedAcl.GetSecurityDescriptorSddlForm($sections)) { throw 'Dedicated key ACL verification failed.' }
+    Assert-PeerKeyAcl -Actual $actual -Expected (New-CageKeyAcl $userSid)
     if ([IO.File]::ReadAllText($configPath) -cne $oldConfig) { throw 'sshd config changed during enrollment; rerun preflight.' }
     Set-CageSshConfig -Path $configPath -Content $candidate -SshdExe $sshdExe -ValidateUser $UserName -GuestAddress $GuestAddress
     if ((Get-Service -Name sshd -ErrorAction Stop).Status -ne 'Running') { throw 'sshd is not running after restart.' }

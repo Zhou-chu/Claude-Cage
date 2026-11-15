@@ -63,7 +63,7 @@ Assert-Rejected { & $source -GuestPublicKey x -GuestAddress x -HostAddress x -Ex
 foreach ($name in @('Assert-PeerAddress','Assert-PeerPublicKey','Assert-PeerPlainPath',
     'Initialize-PeerNativeMembership','ConvertFrom-PeerGroupAccount','Resolve-PeerGroupName',
     'Read-PeerMembershipPage','Get-PeerGroupMemberSids','Get-PeerMembership','Assert-PeerExistingAccount',
-    'Set-PeerAccountEnabled','Restore-PeerDisabledAccount')) {
+    'Set-PeerAccountEnabled','Restore-PeerDisabledAccount','Get-PeerKeyAclRuleSet','Assert-PeerKeyAcl')) {
     $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
     Assert ($null -ne $definition) "Isolated function $name exists"
     . ([scriptblock]::Create($definition.Extent.Text))
@@ -92,6 +92,49 @@ Assert-Rejected { Assert-PeerPublicKey ('ssh-ed25519 ' + [Convert]::ToBase64Stri
 Assert-PeerPlainPath $source
 Assert $true 'Read-only ancestor traversal handles FileInfo and DirectoryInfo under strict mode'
 . (Join-Path $PSScriptRoot 'host-access-common.ps1')
+# Compare access facts rather than NTFS AutoInherited history/ACE order.
+function New-TestKeyDescriptor([string]$Sddl) {
+    $descriptor = New-Object Security.AccessControl.FileSecurity
+    $descriptor.SetSecurityDescriptorSddlForm($Sddl)
+    return $descriptor
+}
+$aclReader = New-Object Security.Principal.SecurityIdentifier('S-1-5-21-1-2-3-1001')
+$aclExpected = New-CageKeyAcl $aclReader
+$sidText = $aclReader.Value
+$normalSddl = 'O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;0x1200a9;;;' + $sidText + ')'
+foreach ($sddl in @($normalSddl, $normalSddl.Replace('D:P','D:PAI'),
+    ('O:BAD:PAI(A;;0x1200a9;;;' + $sidText + ')(A;;FA;;;BA)(A;;FA;;;SY)'))) {
+    Assert-PeerKeyAcl -Actual (New-TestKeyDescriptor $sddl) -Expected $aclExpected
+    Assert $true 'Exact permissions accept NTFS AutoInherited normalization and harmless allow-entry order'
+}
+$badAcls = @(
+    $normalSddl.Replace('O:BA','O:SY'),
+    $normalSddl.Replace('D:P','D:AI'),
+    ($normalSddl + '(A;;FA;;;WD)'),
+    $normalSddl.Replace('0x1200a9','FA'),
+    $normalSddl.Replace('0x1200a9','0x1301bf'),
+    $normalSddl.Replace('(A;;FA;;;SY)','(A;ID;FA;;;SY)'),
+    $normalSddl.Replace('(A;;FA;;;SY)','(D;;FA;;;SY)'),
+    $normalSddl.Replace('(A;;FA;;;SY)',''),
+    $normalSddl.Replace($sidText,'S-1-5-21-1-2-3-1002'),
+    'O:BAD:P'
+)
+foreach ($sddl in $badAcls) {
+    Assert-Rejected { Assert-PeerKeyAcl -Actual (New-TestKeyDescriptor $sddl) -Expected $aclExpected } 'Reject changed owner/protection/SID/mask, extra/missing/inherited/deny entries or empty DACL'
+}
+Assert-Rejected { Assert-PeerKeyAcl -Actual $null -Expected $aclExpected } 'Reject missing actual descriptor'
+# Actual NTFS roundtrip, owner=current tester only so no elevation is required.
+$fixtureRoot = Join-Path $PSScriptRoot '.test-output'
+$null = New-Item -ItemType Directory -Path $fixtureRoot -Force
+$fixture = Join-Path $fixtureRoot ('acl-semantic-test-' + [guid]::NewGuid().ToString('N') + '.tmp')
+$currentSid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+$fixtureAcl = New-CageKeyAcl $currentSid
+$fixtureAcl.SetOwner($currentSid)
+[IO.File]::WriteAllText($fixture, 'Isolated ACL normalization fixture')
+Set-Acl -LiteralPath $fixture -AclObject $fixtureAcl
+$fixtureActual = Get-Acl -LiteralPath $fixture
+Assert-PeerKeyAcl -Actual $fixtureActual -Expected $fixtureAcl
+Assert $fixtureActual.AreAccessRulesProtected 'Real file roundtrip retains protection and exact three permissions despite normalization'
 $original = "Port 22`r`nAllowUsers unrelated`r`nMatch Group administrators`r`n    AuthorizedKeysFile admin_keys`r`n"
 $candidate = New-CageSshConfig $original 'cageops' '100.64.0.10'
 Assert ($candidate.Contains('AllowUsers unrelated')) 'Preserve unrelated allowlist'
