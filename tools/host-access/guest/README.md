@@ -6,6 +6,20 @@ intentionally POSIX-only and fails closed on Windows. Nothing in this directory
 installs itself, starts/restarts Cage or a VM, enrolls a tailnet node, or requests
 approval merely by being imported or by displaying help.
 
+## Native OpenSSH integration
+
+The host installer explicitly runs `cage_host_native.py` after provisioning the
+private client config and pinned host key. It installs `ssh windows-host` and
+`sftp windows-host`, using `/usr/local/bin/cage-tailnet dial` directly, not a VPN,
+public fallback, or a bearer token embedded in SSH arguments. The managed native
+include is prepended while retaining Cage's automatic tailnet include unchanged.
+The original SSH config is backed up once; reinstallation is idempotent and
+rejects symlink/unmanaged native files. A real `ssh -G` parse validates the
+candidate before installation. Full guest usage is in
+`~/.config/cage-host/USAGE.md`; it explicitly retains the standard-user and
+Desktop-tool boundaries. This does not modify Claude Desktop settings/login,
+start services, or submit approval requests. Importing the module has no effects.
+
 ## Protocol verified in this checkout
 
 The implementation was derived from these sources, not a `--help` probe:

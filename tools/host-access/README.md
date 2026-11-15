@@ -39,9 +39,17 @@ Cage的tailnet是userspace网络，不能把没有`tailscale0`当成故障，也
 
 部署器读取宿主审批令牌，经Cage标准输入写入客机私有配置，不把凭据放进命令行、日志或临时脚本。它核对本机22端口属于sshd服务，再从独立本机连接取得公开Ed25519主机键，固定到客机专用known_hosts。不会读取宿主私钥，也不会更改原有客机known_hosts。
 
+安装器还会配置标准OpenSSH别名`windows-host`，直接使用Cage内置的`cage-tailnet dial`传输，不依赖审批代理。它固定宿主用户、私钥和已独立核对的主机键；保留Cage自动维护的私网Include与用户其他SSH规则。首次原配置备份和使用说明存放在客机`~/.config/cage-host/`，新增配置通过真实`ssh -G`解析后才写入。
+
+Claude Desktop服务与Cage终端都使用客机账号`cage`。在有终端能力的模式下，可直接执行下列命令；这不代表纯聊天模式自动拥有命令执行工具，也不提供桌面鼠标控制。
+
 客机使用：
 
 ```bash
+ssh windows-host 'whoami'
+ssh windows-host 'powershell.exe -NoProfile -NonInteractive -Command "Get-Location"'
+sftp windows-host
+# 下面的原有固定通道仍可使用
 ~/.local/bin/cage-host ssh 'whoami'
 ~/.local/bin/cage-host health
 # 以下才会发送管理员请求：逐次人工批准；不自动重试
@@ -49,7 +57,7 @@ printf '%s\n' '{"reason":"查看宿主系统版本","command":"Get-ComputerInfo 
   | ~/.local/bin/cage-host run
 ```
 
-SSH使用严格主机键检查、固定身份文件、公钥认证和一次连接，不继承用户SSH配置、代理跳转或连接复用。主机键变更会拒绝；请独立核对后重跑部署器，不要关闭校验。
+原有`cage-host ssh`封装使用严格主机键检查、固定身份文件、公钥认证和一次连接，不继承用户SSH配置、代理跳转或连接复用。标准`ssh windows-host`则保留用户原规则，以置顶的宿主专用段固定传输、身份和主机键校验，并关闭代理转发及连接复用。主机键变更会拒绝；请独立核对后重跑部署器，不要关闭校验。
 
 客户端由系统Python3标准库实现；不安装第三方库。配置和令牌为0600，拒绝不安全权限、符号链接和非本用户/非root拥有的私有文件。具体客户端协议与测试见`guest/README.md`。
 
