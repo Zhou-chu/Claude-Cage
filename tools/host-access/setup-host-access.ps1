@@ -1,227 +1,152 @@
-﻿# Cage 宿主机访问配置（B 方案：专用标准用户 cageops）
-#
-# 以管理员身份运行：
-#   powershell -NoProfile -ExecutionPolicy Bypass -File .\setup-host-access.ps1
-#
-# 设计要点（均为实测踩坑得来）：
-#   - 32 位 PowerShell 下 System32 被重定向到 SysWOW64，因此自动改用 64 位重启；
-#   - 账号操作一律走 ADSI，不调用 net.exe（避免 PS 5.1 与原生程序的交互问题）；
-#   - sshd.exe 路径从服务注册信息解析，本机 OpenSSH 装在 Program Files 而非 System32；
-#   - 每一步打印进度，失败时直接指出是哪一步。
-
+# Cage host access: dedicated standard user + explicit human approval.
+# Windows PowerShell 5.1, run as administrator. Deployment values stay local.
 [CmdletBinding()]
 param(
-    [string]$GuestPublicKey = 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILHUyxOBrXtTacXxJ0eTYbp2ijdeeYb1cqHZiiGLLCuI cage-guest@workstation',
-    [string]$GuestAddress = '100.65.250.76',
-    [string]$UserName = 'cageops',
-    [string]$AlsoAllowUsers = 'Zhouchu',
-    [int]$BrokerPort = 8642,
-    [switch]$AlreadyRelaunched
+    [string]$GuestPublicKey,
+    [string]$GuestAddress,
+    [ValidatePattern('^[a-z_][a-z0-9_-]{0,30}$')][string]$UserName = 'cageops',
+    [string]$BrokerAddress,
+    [ValidateRange(1024,65535)][int]$BrokerPort = 8642,
+    [switch]$AlreadyRelaunched,
+    [switch]$CheckOnly
 )
-
 $ErrorActionPreference = 'Stop'
-$script:step = '初始化'
-
+$script:step = 'initialization'
 trap {
-    Write-Host ''
-    Write-Host ("[失败] 步骤: " + $script:step) -ForegroundColor Red
-    Write-Host ("       " + $_.Exception.Message) -ForegroundColor Red
-    Write-Host ("       位置: " + $_.InvocationInfo.ScriptLineNumber) -ForegroundColor DarkGray
+    Write-Host ("[FAILED] {0}: {1} (line {2})" -f $script:step, $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) -ForegroundColor Red
     exit 1
 }
+function Step([string]$Name) { $script:step = $Name; Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Name) -ForegroundColor Cyan }
 
-function Step {
-    param([string]$Name)
-    $script:step = $Name
-    Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Name) -ForegroundColor Cyan
-}
-
-# ---------------------------------------------------------------- 0. 位数适配
-if (-not [Environment]::Is64BitProcess -and -not $AlreadyRelaunched) {
+# Preserve every explicitly supplied parameter when switching bitness.
+if (-not [Environment]::Is64BitProcess) {
+    if ($AlreadyRelaunched) { throw '64-bit PowerShell relaunch failed.' }
     $x64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path $x64)) {
-        $x64 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    }
-    Write-Host '检测到 32 位 PowerShell，正在以 64 位重新启动…' -ForegroundColor Yellow
-    & $x64 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -AlreadyRelaunched
+    if (-not (Test-Path -LiteralPath $x64)) { throw 'Cannot find native 64-bit PowerShell.' }
+    $forward = @{}
+    foreach ($entry in $PSBoundParameters.GetEnumerator()) { $forward[$entry.Key] = $entry.Value }
+    $forward['AlreadyRelaunched'] = $true
+    $serialized = [Management.Automation.PSSerializer]::Serialize($forward)
+    $encodedParams = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($serialized))
+    $literalPath = "'" + $PSCommandPath.Replace("'", "''") + "'"
+    $code = '$p=[Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''' + $encodedParams + '''))); & ' + $literalPath + ' @p; exit $LASTEXITCODE'
+    Write-Host 'Switching to 64-bit Windows PowerShell...'
+    & $x64 -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -InputFormat Text -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)))
     exit $LASTEXITCODE
 }
-
+. (Join-Path $PSScriptRoot 'host-access-common.ps1')
+$localPath = Join-Path $PSScriptRoot 'host-access.local.psd1'
+if (Test-Path -LiteralPath $localPath) {
+    $local = Import-PowerShellDataFile -LiteralPath $localPath
+    foreach ($name in @('GuestPublicKey','GuestAddress','BrokerAddress')) {
+        if (-not (Get-Variable -Name $name -ValueOnly) -and $local.ContainsKey($name)) { Set-Variable -Name $name -Value $local[$name] }
+    }
+}
+foreach ($name in @('GuestPublicKey','GuestAddress','BrokerAddress')) {
+    if (-not (Get-Variable -Name $name -ValueOnly)) { throw "Missing $name. Set parameters or create host-access.local.psd1 (see example)." }
+}
+if ($GuestPublicKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/]+={0,2}(?: [^\r\n]*)?$') { throw 'Expected a single ssh-ed25519 public key.' }
+$brokerIP = $null
+if (-not [Net.IPAddress]::TryParse($BrokerAddress,[ref]$brokerIP) -or $brokerIP.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetwork) { throw 'BrokerAddress must be a tailnet IPv4 address.' }
+$b = $brokerIP.GetAddressBytes()
+if ($b[0] -ne 100 -or $b[1] -lt 64 -or $b[1] -gt 127) { throw 'BrokerAddress must be within 100.64.0.0/10.' }
+if (-not (Get-NetIPAddress -AddressFamily IPv4 -IPAddress $BrokerAddress -ErrorAction SilentlyContinue)) { throw 'BrokerAddress is not assigned to this host.' }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw '需要管理员权限：请右键「以管理员身份运行」后再执行。'
+if ($UserName -eq $identity.Name.Split('\')[-1].ToLowerInvariant()) { throw 'Dedicated user must not be the current host operator.' }
+$sshdExe = Get-CageSshdExe
+$configPath = Join-Path $env:ProgramData 'ssh\sshd_config'
+$oldConfig = [IO.File]::ReadAllText($configPath)
+$candidate = New-CageSshConfig $oldConfig $UserName $GuestAddress
+if ($CheckOnly) {
+    Write-Host 'Read-only preflight OK: parameters, address, sshd path and config transformation.'
+    Write-Host 'No accounts, ACLs, firewall rules or services changed. Run tests for sshd candidate validation.'
+    exit 0
 }
+if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run this script in an administrator PowerShell window.' }
+Write-Host '== Cage host access setup =='
+Write-Host ('PowerShell {0}; 64-bit={1}' -f $PSVersionTable.PSVersion,[Environment]::Is64BitProcess)
 
-Write-Host '== Cage 宿主机访问配置 ==' -ForegroundColor Green
-Write-Host ("   PowerShell {0} / 64位={1} / 用户={2}" -f $PSVersionTable.PSVersion, [Environment]::Is64BitProcess, $identity.Name) -ForegroundColor DarkGray
+Step "1/6 Dedicated local account: $UserName"
+$computer = [ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)
+$names = @($computer.Children | Where-Object { $_.SchemaClassName -eq 'user' } | ForEach-Object { [string]$_.Name })
+if ($names -notcontains $UserName) {
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $bytes = New-Object byte[] 32; $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    $user = $computer.Create('User',$UserName)
+    $user.SetPassword(('aA1!' + [Convert]::ToBase64String($bytes)))
+    $user.Put('Description','Cage guest SSH operator (standard user)')
+    $user.SetInfo()
+    $user.UserFlags.Value = $user.UserFlags.Value -bor 0x10000
+    $user.SetInfo()
+    Write-Host 'Created with a random password (not displayed).'
+} else { Write-Host 'Account exists; password unchanged.' }
+$userSid = ([Security.Principal.NTAccount]::new($env:COMPUTERNAME,$UserName)).Translate([Security.Principal.SecurityIdentifier])
+$userPath = "WinNT://{0}/{1}" -f $env:COMPUTERNAME,$UserName
 
-$computerPath = "WinNT://{0},computer" -f $env:COMPUTERNAME
+Step '2/6 Verify standard-user group membership'
+$adminName = (Get-CageSid 'S-1-5-32-544').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+$admins = [ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME,$adminName)
+if ([bool]$admins.psbase.Invoke('IsMember', @($userPath))) { throw 'Dedicated account is an Administrator. Refusing to grant access; remove membership explicitly first.' }
+$usersName = (Get-CageSid 'S-1-5-32-545').Translate([Security.Principal.NTAccount]).Value.Split('\')[-1]
+$users = [ADSI]("WinNT://{0}/{1},group" -f $env:COMPUTERNAME,$usersName)
+if (-not [bool]$users.psbase.Invoke('IsMember', @($userPath))) { $users.Add($userPath) }
+Write-Host 'Verified: not a direct Administrators member; Users membership present.'
 
-function Get-LocalUserNames {
-    $computer = [ADSI]$computerPath
-    @($computer.Children | Where-Object { $_.SchemaClassName -eq 'user' } | ForEach-Object { $_.Name })
-}
+Step '3/6 Public key and SID-based ACL'
+$keyFile = Join-Path $env:ProgramData "ssh\${UserName}_authorized_keys"
+# This file belongs exclusively to this integration. A from= option also restricts legacy SSH configurations.
+$line = 'from="' + $GuestAddress + '",no-agent-forwarding,no-port-forwarding,no-X11-forwarding ' + $GuestPublicKey.Trim()
+[IO.File]::WriteAllText($keyFile, ($line + "`r`n"), [Text.Encoding]::ASCII)
+Set-Acl -LiteralPath $keyFile -AclObject (New-CageKeyAcl $userSid)
+$actualAcl = Get-Acl -LiteralPath $keyFile
+if ($actualAcl.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne 'S-1-5-32-544') { throw 'Unexpected public key file owner.' }
+Write-Host 'Owner=BUILTIN Administrators SID; write=SYSTEM/Admins; dedicated user=read only.'
 
-function New-RandomPassword {
-    param([int]$Length = 32)
-    $chars = 'abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789!@#$%*-_=+'
-    -join (1..$Length | ForEach-Object { $chars[(Get-Random -Maximum $chars.Length)] })
-}
+Step '4/6 Validate and install dedicated-user sshd rules'
+Set-CageSshConfig $configPath $candidate $sshdExe $UserName $GuestAddress
+Write-Host 'Candidate and installed config validated; sshd restarted. Existing unrelated SSH rules preserved.'
 
-# ---------------------------------------------------------------- 1. 账号
-Step "1/6 检查并创建本地账号 $UserName"
-$exists = (Get-LocalUserNames) -contains $UserName
-if ($exists) {
-    Write-Host "   账号已存在，跳过创建。"
-} else {
-    $computer = [ADSI]$computerPath
-    $newUser = $computer.Create('User', $UserName)
-    $newUser.SetPassword((New-RandomPassword))
-    $newUser.Put('Description', 'Cage guest SSH operator (standard user)')
-    $newUser.SetInfo()
-    # DONT_EXPIRE_PASSWORD (0x10000)：密码永不过期，避免数月后 SSH 突然失效
-    $newUser.UserFlags.Value = $newUser.UserFlags.Value -bor 0x10000
-    $newUser.SetInfo()
-    Write-Host "   已创建（随机密码，仅公钥登录）。"
-}
-
-Step "2/6 确认为标准用户（不在 Administrators 组）"
-try {
-    $admins = [ADSI]("WinNT://{0}/Administrators,group" -f $env:COMPUTERNAME)
-    $admins.Remove(("WinNT://{0}/{1}" -f $env:COMPUTERNAME, $UserName))
-    Write-Host "   已从 Administrators 移除。" -ForegroundColor Yellow
-} catch {
-    Write-Host "   不在 Administrators 组（符合预期）。"
-}
-
-# ---------------------------------------------------------------- 2. 公钥
-Step '3/6 写入客机公钥并收紧权限'
-$profileDir = Join-Path $env:SystemDrive "Users\$UserName"
-if (-not (Test-Path $profileDir)) {
-    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
-    $dacl = Get-Acl $profileDir
-    $dacl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $UserName)))
-    Set-Acl -Path $profileDir -AclObject $dacl
-    Write-Host "   已创建用户目录 $profileDir。"
-}
-
-# 账号从未交互登录过时 Windows 不注册用户配置文件，sshd 解析不到家目录下的
-# authorized_keys。因此公钥写到系统级绝对路径，并在 sshd_config 里用
-# Match User 显式指向它——不依赖家目录解析。
-$keyDir = Join-Path $env:ProgramData 'ssh'
-$keyFile = Join-Path $keyDir "cageops_authorized_keys"
-$keyLine = $GuestPublicKey.Trim()
-$current = if (Test-Path $keyFile) { @(Get-Content $keyFile) } else { @() }
-if ($current -notcontains $keyLine) {
-    @($current | Where-Object { $_ -ne '' }) + $keyLine | Set-Content -Path $keyFile -Encoding ascii
-    Write-Host "   已写入公钥到 $keyFile"
-} else {
-    Write-Host '   公钥已存在。'
-}
-
-# sshd 要求该文件只能由 SYSTEM/Administrators 写入
-& icacls.exe $keyFile /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
-$acl = Get-Acl $keyFile
-$acl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, 'Administrators')))
-Set-Acl -Path $keyFile -AclObject $acl
-Write-Host '   权限已收紧。'
-
-# ---------------------------------------------------------------- 3. sshd
-Step '4/6 配置 sshd 白名单'
-$sshdConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
-if (-not (Test-Path $sshdConfig)) { throw "找不到 $sshdConfig，请确认 OpenSSH Server 已安装。" }
-$backup = "$sshdConfig.cage-bak"
-if (-not (Test-Path $backup)) { Copy-Item $sshdConfig $backup; Write-Host '   已备份 sshd_config。' }
-
-$content = Get-Content $sshdConfig -Raw
-$allowLine = "$UserName@$GuestAddress"
-if ($AlsoAllowUsers) { $allowLine += ' ' + (($AlsoAllowUsers -split '[,\s]+' | Where-Object { $_ }) -join ' ') }
-if ($content -match '(?m)^\s*AllowUsers\s') {
-    Write-Host '   已存在 AllowUsers，不覆盖。请确认其中包含：' -ForegroundColor Yellow
-    Write-Host "      $allowLine" -ForegroundColor Yellow
-} else {
-    $entry = "`r`n# Cage: dedicated standard user, fixed tailnet source only`r`nAllowUsers $allowLine`r`n"
-    Add-Content -Path $sshdConfig -Value $entry -Encoding ascii
-    Write-Host "   已添加 AllowUsers $allowLine"
-}
-
-# Match 块必须插在已有的 Match 块之前：sshd 的 Match 会一直生效到下一个 Match 或行尾
-$matchBlock = @(
-    "# Cage: absolute key path, does not depend on profile resolution"
-    "Match User $UserName"
-    "    AuthorizedKeysFile __PROGRAMDATA__/ssh/cageops_authorized_keys"
-)
-if ($content -match ('(?m)^\s*Match\s+User\s+' + [regex]::Escape($UserName))) {
-    Write-Host '   已存在该用户的 Match User 块，跳过。'
-} else {
-    $lines = @(Get-Content $sshdConfig)
-    $insertAt = -1
-    for ($i = 0; $i -lt $lines.Count; $i++) {
-        if ($lines[$i] -match '^\s*Match\s+Group\s+administrators') { $insertAt = $i; break }
-    }
-    if ($insertAt -ge 0) {
-        $before = $lines[0..($insertAt - 1)]
-        $after = $lines[$insertAt..($lines.Count - 1)]
-        $merged = @($before) + $matchBlock + @('') + @($after)
-        Set-Content -Path $sshdConfig -Value $merged -Encoding ascii
-    } else {
-        Add-Content -Path $sshdConfig -Value ("`r`n" + ($matchBlock -join "`r`n") + "`r`n") -Encoding ascii
-    }
-    Write-Host '   已添加 Match User 块（绝对公钥路径）。'
-}
-
-$service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
-if (-not $service) { throw 'sshd 服务不存在，请确认 OpenSSH Server 已安装。' }
-$sshdExe = ($service.PathName -replace '^"([^"]+)".*$', '$1') -replace '^([^\s]+\.exe).*$', '$1'
-if (-not (Test-Path $sshdExe)) { throw "sshd 可执行文件不存在：$sshdExe" }
-Write-Host "   sshd: $sshdExe"
-
-& $sshdExe -t
-if ($LASTEXITCODE -ne 0) {
-    Copy-Item $backup $sshdConfig -Force
-    throw 'sshd 配置校验失败，已回滚，未重启服务。'
-}
-Restart-Service sshd
-Write-Host '   校验通过，服务已重启。'
-
-# ---------------------------------------------------------------- 4. 防火墙
-Step "5/6 放行审批代理端口 $BrokerPort"
+Step '5/6 Limit broker firewall rule to tailnet endpoints'
 $ruleName = 'Cage approval broker'
-& netsh.exe advfirewall firewall show rule "name=$ruleName" | Out-Null
-$ruleExists = ($LASTEXITCODE -eq 0)
-if ($ruleExists) {
-    Write-Host '   规则已存在。'
-} else {
-    & netsh.exe advfirewall firewall add rule "name=$ruleName" dir=in action=allow protocol=TCP "localport=$BrokerPort" "remoteip=$GuestAddress" | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "添加防火墙规则失败（netsh 退出码 $LASTEXITCODE）。" }
-    Write-Host "   已放行（仅来源 $GuestAddress）。"
-}
+$rule = Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContinue
+if ($rule) { $rule | Remove-NetFirewallRule }
+New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Protocol TCP -LocalAddress $BrokerAddress -LocalPort $BrokerPort -RemoteAddress $GuestAddress -Profile Any | Out-Null
+Write-Host 'Firewall limited to the configured host and guest tailnet IPs.'
 
-# ---------------------------------------------------------------- 5. 代理自启
-Step '6/6 安装审批代理并设为登录自启'
+Step '6/6 Install approval broker with protected directory'
 $brokerExe = Join-Path $PSScriptRoot 'cage-approve.exe'
-if (Test-Path $brokerExe) {
-    $target = Join-Path $env:ProgramData 'CageBroker'
-    New-Item -ItemType Directory -Path $target -Force | Out-Null
-    Copy-Item $brokerExe $target -Force
-    $startup = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp'
-    $lnk = Join-Path $startup 'Cage approval broker.lnk'
-    $shell = New-Object -ComObject WScript.Shell
-    $s = $shell.CreateShortcut($lnk)
-    $s.TargetPath = Join-Path $target 'cage-approve.exe'
-    $s.WorkingDirectory = $target
-    $s.Save()
-    Write-Host "   已安装到 $target 并设置自启。"
-} else {
-    Write-Host '   未找到 cage-approve.exe，跳过（把 exe 放到本脚本同目录后重跑）。' -ForegroundColor Yellow
+if (-not (Test-Path -LiteralPath $brokerExe)) { throw 'Build cage-approve.exe before setup. SSH configured; broker installation incomplete.' }
+$target = Join-Path $env:ProgramData 'CageBroker'
+if (Test-Path -LiteralPath $target) {
+    if ((Get-Item -LiteralPath $target -Force).Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Broker directory must not be a reparse point.' }
+} else { New-Item -ItemType Directory -Path $target | Out-Null }
+$targetExe = Join-Path $target 'cage-approve.exe'
+# Stop ONLY the integration binary at this exact installed path, not arbitrary names.
+Get-CimInstance Win32_Process -Filter "Name='cage-approve.exe'" | Where-Object { $_.ExecutablePath -eq $targetExe } | ForEach-Object { Stop-Process -Id $_.ProcessId -ErrorAction Stop }
+Set-Acl -LiteralPath $target -AclObject (New-CageBrokerAcl $identity.User)
+# Remove legacy broad child permissions; root ACL is inherited by each exact descendant.
+$children = @(Get-ChildItem -LiteralPath $target -Recurse -Force)
+if (@($children | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint }).Count) { throw 'Broker contents contain a reparse point; inspect before proceeding.' }
+foreach ($item in $children) {
+    $childAcl = if ($item.PSIsContainer) { New-Object Security.AccessControl.DirectorySecurity } else { New-Object Security.AccessControl.FileSecurity }
+    $childAcl.SetOwner((Get-CageSid 'S-1-5-32-544'))
+    $childAcl.SetAccessRuleProtection($false,$false)
+    Set-Acl -LiteralPath $item.FullName -AclObject $childAcl
 }
-
-# ---------------------------------------------------------------- 汇总
+Copy-Item -LiteralPath $brokerExe -Destination $targetExe -Force
+# Replace the old all-users startup entry with an entry only for this trusted operator.
+$oldLink = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp\Cage approval broker.lnk'
+if (Test-Path -LiteralPath $oldLink) { Remove-Item -LiteralPath $oldLink -Force }
+$startup = [Environment]::GetFolderPath('Startup')
+$link = Join-Path $startup 'Cage approval broker.lnk'
+$shell = New-Object -ComObject WScript.Shell
+$shortcut = $shell.CreateShortcut($link)
+$shortcut.TargetPath = $targetExe
+$shortcut.Arguments = '-addr ' + $BrokerAddress + ':' + $BrokerPort + ' -allow-source ' + $GuestAddress
+$shortcut.WorkingDirectory = $target
+$shortcut.Save()
+Write-Host 'Installed for current operator login only. Broker was NOT started from this elevated shell.'
+Write-Host 'Start the Cage approval broker shortcut from a NORMAL (non-administrator) desktop session.'
 Write-Host ''
-Write-Host '== 完成 ==' -ForegroundColor Green
-Write-Host "账号        : $UserName（标准用户）"
-Write-Host "允许来源    : $GuestAddress"
-Write-Host "公钥文件    : $keyFile"
-Write-Host "审批代理端口: $BrokerPort"
-Write-Host ''
-Write-Host '吊销：.\revoke-host-access.ps1' -ForegroundColor DarkGray
+Write-Host '== Setup complete; SSH authentication still requires a real guest test =='
+Write-Host "User: $UserName; public key: $keyFile; broker: ${BrokerAddress}:$BrokerPort"

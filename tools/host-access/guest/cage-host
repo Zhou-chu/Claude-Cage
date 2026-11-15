@@ -1,0 +1,6 @@
+#!/usr/bin/python3 -I
+"""Keep this launcher beside cage_host.py; system CPython, no import from CWD."""
+from pathlib import Path
+import runpy
+
+runpy.run_path(str(Path(__file__).resolve().with_name("cage_host.py")), run_name="__main__")

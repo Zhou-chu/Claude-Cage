@@ -1,113 +1,48 @@
-﻿# 吊销 Cage 对宿主机的访问
-#
-# 以管理员身份运行：
-#   powershell -NoProfile -ExecutionPolicy Bypass -File .\revoke-host-access.ps1
-#
-# 与 setup 脚本一致：32 位自动切 64 位、账号操作走 ADSI、sshd 路径从服务解析。
-
+# Revoke only this integration, preserving unrelated SSH keys and policy.
 [CmdletBinding()]
 param(
-    [string]$UserName = 'cageops',
-    [int]$BrokerPort = 8642,
+    [ValidatePattern('^[a-z_][a-z0-9_-]{0,30}$')][string]$UserName = 'cageops',
     [switch]$RemoveUser,
     [switch]$AlreadyRelaunched
 )
-
-$ErrorActionPreference = 'Stop'
-$script:step = '初始化'
-
-trap {
-    Write-Host ''
-    Write-Host ("[失败] 步骤: " + $script:step) -ForegroundColor Red
-    Write-Host ("       " + $_.Exception.Message) -ForegroundColor Red
-    exit 1
-}
-
-function Step {
-    param([string]$Name)
-    $script:step = $Name
-    Write-Host ("[{0}] {1}" -f (Get-Date -Format 'HH:mm:ss'), $Name) -ForegroundColor Cyan
-}
-
-if (-not [Environment]::Is64BitProcess -and -not $AlreadyRelaunched) {
-    $x64 = Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
-    if (-not (Test-Path $x64)) {
-        $x64 = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-    }
-    Write-Host '检测到 32 位 PowerShell，正在以 64 位重新启动…' -ForegroundColor Yellow
-    $extra = @()
-    if ($RemoveUser) { $extra += '-RemoveUser' }
-    & $x64 -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -AlreadyRelaunched -UserName $UserName -BrokerPort $BrokerPort @extra
+$ErrorActionPreference='Stop'
+if (-not [Environment]::Is64BitProcess) {
+    if ($AlreadyRelaunched) { throw '64-bit relaunch failed.' }
+    $x64=Join-Path $env:SystemRoot 'Sysnative\WindowsPowerShell\v1.0\powershell.exe'
+    $forward=@{UserName=$UserName;AlreadyRelaunched=$true;RemoveUser=[bool]$RemoveUser}
+    $params=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([Management.Automation.PSSerializer]::Serialize($forward)))
+    $path="'"+$PSCommandPath.Replace("'","''")+"'"
+    $code='$p=[Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('''+$params+'''))); & '+$path+' @p; exit $LASTEXITCODE'
+    & $x64 -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -InputFormat Text -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)))
     exit $LASTEXITCODE
 }
-
-$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-if (-not (New-Object Security.Principal.WindowsPrincipal($identity)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw '需要管理员权限：请右键「以管理员身份运行」后再执行。'
+. (Join-Path $PSScriptRoot 'host-access-common.ps1')
+$identity=[Security.Principal.WindowsIdentity]::GetCurrent()
+if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run in an administrator PowerShell window.' }
+if ($UserName -eq $identity.Name.Split('\')[-1].ToLowerInvariant()) { throw 'Refusing to revoke the current host operator.' }
+$computer=[ADSI]("WinNT://{0},computer" -f $env:COMPUTERNAME)
+$exists=@($computer.Children | Where-Object {$_.SchemaClassName -eq 'user'} | ForEach-Object {[string]$_.Name}) -contains $UserName
+if ($exists) {
+    $user=[ADSI]("WinNT://{0}/{1},user" -f $env:COMPUTERNAME,$UserName)
+    $user.UserFlags.Value=$user.UserFlags.Value -bor 2
+    $user.SetInfo()
+    Write-Host 'Dedicated account disabled first. Existing SSH sessions are not automatically terminated.'
 }
-
-$computerPath = "WinNT://{0},computer" -f $env:COMPUTERNAME
-
-Step '1/4 清空客机公钥'
-$keyFile = Join-Path $env:SystemDrive "Users\$UserName\.ssh\authorized_keys"
-if (Test-Path $keyFile) {
-    Set-Content -Path $keyFile -Value '' -Encoding ascii
-    Write-Host "   已清空 $keyFile"
-} else {
-    Write-Host '   公钥文件不存在，跳过。'
-}
-
-Step '2/4 移除 sshd 白名单'
-$sshdConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
-if (Test-Path $sshdConfig) {
-    $drop = @(
-        ('^\s*AllowUsers\s+.*' + [regex]::Escape($UserName) + '@'),
-        '^\s*#\s*Cage: absolute key path',
-        ('^\s*Match\s+User\s+' + [regex]::Escape($UserName) + '\s*$'),
-        '^\s*AuthorizedKeysFile\s+__PROGRAMDATA__/ssh/cageops_authorized_keys\s*$'
-    )
-    $lines = Get-Content $sshdConfig | Where-Object {
-        $line = $_
-        -not ($drop | Where-Object { $line -match $_ })
-    }
-    Set-Content -Path $sshdConfig -Value $lines -Encoding ascii
-    $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
-    if ($service) {
-        $sshdExe = ($service.PathName -replace '^"([^"]+)".*$', '$1') -replace '^([^\s]+\.exe).*$', '$1'
-        & $sshdExe -t
-        if ($LASTEXITCODE -eq 0) {
-            Restart-Service sshd
-            Write-Host '   已移除并重启 sshd。'
-        } else {
-            Write-Warning '   sshd 校验失败，请手工检查 sshd_config（备份 sshd_config.cage-bak）。'
-        }
-    }
-}
-
-# 同时删除系统级公钥文件
-$sysKey = Join-Path $env:ProgramData 'ssh\cageops_authorized_keys'
-if (Test-Path $sysKey) { Remove-Item $sysKey -Force; Write-Host '   已删除系统级公钥文件。' }
-
-Step '3/4 移除防火墙规则与登录自启'
-& netsh.exe advfirewall firewall delete rule "name=Cage approval broker" | Out-Null
-if ($LASTEXITCODE -eq 0) { Write-Host '   防火墙规则已移除。' }
-Get-Process cage-approve -ErrorAction SilentlyContinue | Stop-Process -Force
-$lnk = Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp\Cage approval broker.lnk'
-if (Test-Path $lnk) { Remove-Item $lnk -Force; Write-Host '   登录自启已移除。' }
-
-Step '4/4 可选删除账号'
-if ($RemoveUser) {
-    $computer = [ADSI]$computerPath
-    $names = @($computer.Children | Where-Object { $_.SchemaClassName -eq 'user' } | ForEach-Object { $_.Name })
-    if ($names -contains $UserName) {
-        $computer.Delete('User', $UserName)
-        Write-Host "   已删除账号 $UserName（用户目录仍保留）。"
-    } else {
-        Write-Host '   账号不存在，跳过。'
-    }
-} else {
-    Write-Host '   保留账号（如需删除请加 -RemoveUser）。'
-}
-
-Write-Host ''
-Write-Host '吊销完成。' -ForegroundColor Green
+$configPath=Join-Path $env:ProgramData 'ssh\sshd_config'
+$content=[IO.File]::ReadAllText($configPath)
+$clean=Remove-CageSshBlock $content $UserName
+if ($clean -ne $content) { Set-CageSshConfig $configPath $clean (Get-CageSshdExe) }
+# Exact dedicated integration key path. Leave unrelated ~/.ssh/authorized_keys untouched.
+$keyFile=Join-Path $env:ProgramData "ssh\${UserName}_authorized_keys"
+if (Test-Path -LiteralPath $keyFile) { [IO.File]::WriteAllText($keyFile,'',[Text.Encoding]::ASCII) }
+Get-NetFirewallRule -DisplayName 'Cage approval broker' -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+$broker=Join-Path $env:ProgramData 'CageBroker\cage-approve.exe'
+Get-CimInstance Win32_Process -Filter "Name='cage-approve.exe'" | Where-Object {$_.ExecutablePath -eq $broker} | ForEach-Object {Stop-Process -Id $_.ProcessId -ErrorAction Stop}
+$links=@(
+    (Join-Path $env:ProgramData 'Microsoft\Windows\Start Menu\Programs\StartUp\Cage approval broker.lnk'),
+    (Join-Path ([Environment]::GetFolderPath('Startup')) 'Cage approval broker.lnk')
+)
+foreach($link in $links) { if(Test-Path -LiteralPath $link) {Remove-Item -LiteralPath $link -Force} }
+if($RemoveUser -and $exists) {$computer.Delete('User',$UserName)}
+Write-Host 'Revoked. Dedicated account is disabled (or removed); unrelated SSH policy and keys retained.'
+Write-Host 'Broker token/logs remain in the protected directory for audit; rotate the token before re-enabling.'

@@ -87,3 +87,9 @@ __pycache__/
 
 # Unfinished local native file-open prototype, excluded from compilation.
 /scripts/guest-os/guest-clipboard-windows/WindowsNativeOpen.cs.local
+
+# Private host-access deployment parameters and compiled broker.
+/tools/host-access/host-access.local.psd1
+/tools/host-access/*.exe
+/tools/cage-approve/*.exe
+/tools/host-access/.test-output/
