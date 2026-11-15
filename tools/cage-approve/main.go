@@ -1,212 +1,480 @@
-// cage-approve —— Cage 宿主机审批代理
-//
-// 运行在宿主机用户会话里，本身**不提权**。它的职责只有三件事：
-//   1. 接收客机（Cage 内 Claude）发来的命令请求；
-//   2. 把**完整命令原文**弹窗给你，由你决定批不批准；
-//   3. 批准后走 Windows 的 runas 提权执行——每次执行都会出现 UAC 确认，
-//      因此即使本进程被攻破，攻击者也拿不到管理员权限，只能替你弹框。
-//
-// 安全边界：
-//   - 监听地址由防火墙限定为客机 tailnet IP；
-//   - 必须携带 token（首次运行生成，写入 %ProgramData%\CageBroker\token）；
-//   - 批准与否只由人决定，代理不做任何自动放行；
-//   - 所有请求（含被拒）都会写审计日志。
+// cage-approve is a human approval broker, not an unattended admin service.
+// UAC is an additional consent boundary, NOT an absolute security guarantee:
+// compromised broker/operator code can deceive a person or misuse their consent.
 package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
-)
-
-var (
-	user32          = syscall.NewLazyDLL("user32.dll")
-	messageBoxW     = user32.NewProc("MessageBoxW")
-	shellExecuteExW = syscall.NewLazyDLL("shell32.dll").NewProc("ShellExecuteExW")
+	"unicode"
+	"unicode/utf16"
+	"unicode/utf8"
 )
 
 const (
-	mbOK        = 0x00000000
-	mbOKCancel  = 0x00000001
-	mbIconWarn  = 0x00000030
-	mbIconQuest = 0x00000020
-	mbTopmost   = 0x00001000
-	mbSetFg     = 0x00010000
+	maxCommandBytes = 4096
+	maxReasonBytes  = 1024
+	maxRequestBytes = 32 << 10 // accommodates JSON escapes, not a larger command
+	maxOutputBytes  = 1 << 20
+	notExecuted     = -1
 )
-
-func messageBox(title, text string, flags uintptr) int {
-	t, _ := syscall.UTF16PtrFromString(text)
-	c, _ := syscall.UTF16PtrFromString(title)
-	r, _, _ := messageBoxW.Call(0, uintptr(unsafe.Pointer(t)), uintptr(unsafe.Pointer(c)), flags)
-	return int(r)
-}
-
-type broker struct {
-	root  string
-	token string
-	mu    sync.Mutex // 一次只处理一个请求，避免弹窗排队失控
-	uid   int
-}
-
-func (b *broker) logf(format string, args ...any) {
-	line := fmt.Sprintf("%s %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
-	f, err := os.OpenFile(filepath.Join(b.root, "audit.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
-	if err == nil {
-		f.WriteString(line)
-		f.Close()
-	}
-}
-
-func (b *broker) authorized(r *http.Request) bool {
-	got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	return subtle.ConstantTimeCompare([]byte(got), []byte(b.token)) == 1
-}
 
 type runRequest struct {
 	Command string `json:"command"`
 	Reason  string `json:"reason"`
 }
 
-type runResponse struct {
-	Approved bool   `json:"approved"`
-	ExitCode int    `json:"exit_code"`
-	Output   string `json:"output"`
+type approval struct {
+	Command string
+	Reason  string
+	Digest  string
 }
 
-// escapePowerShell 把任意文本变成单引号字面量，避免拼接注入
-func escapePowerShell(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+type runResult struct {
+	Executed bool
+	ExitCode int
+	Output   string
+	Error    string
+}
+
+type runResponse struct {
+	Approved bool   `json:"approved"`
+	Executed bool   `json:"executed"`
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output"`
+	Digest   string `json:"command_sha256,omitempty"`
+	Error    string `json:"error,omitempty"`
+}
+
+type broker struct {
+	root        string
+	token       string
+	allowSource netip.Addr
+	mu          sync.Mutex // TryLock: do not queue requests behind a human dialog
+	prompt      func(approval) (bool, error)
+	runner      func(approval) runResult
+	verifyRoot  func() error
+	audit       func(string) error
+}
+
+func commandDigest(command string) string {
+	sum := sha256.Sum256([]byte(command))
+	return hex.EncodeToString(sum[:])
+}
+
+func validateVisible(name, value string, limit int, required bool) error {
+	if len(value) > limit {
+		return fmt.Errorf("%s exceeds %d UTF-8 bytes", name, limit)
+	}
+	if !utf8.ValidString(value) {
+		return fmt.Errorf("%s is not valid UTF-8", name)
+	}
+	if required && strings.TrimSpace(value) == "" {
+		return fmt.Errorf("%s is empty", name)
+	}
+	for _, r := range value {
+		// Single-line fields only. In particular reject NUL, CR/LF, TAB,
+		// bidi overrides/isolates, zero-width format controls and line separators.
+		// U+FFFD is also rejected: encoding/json replaces invalid Unicode with it.
+		if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || r == utf8.RuneError {
+			return fmt.Errorf("%s contains a control/format character U+%04X", name, r)
+		}
+	}
+	return nil
+}
+
+func decodeRequest(w http.ResponseWriter, r *http.Request) (runRequest, error) {
+	var req runRequest
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBytes))
+	start, err := dec.Token()
+	if err != nil || start != json.Delim('{') {
+		return req, errors.New("expected a JSON object")
+	}
+	seen := make(map[string]bool, 2)
+	for dec.More() {
+		key, err := dec.Token()
+		if err != nil {
+			return req, errors.New("bad JSON field")
+		}
+		name, ok := key.(string)
+		if !ok || (name != "command" && name != "reason") || seen[name] {
+			return req, errors.New("unknown or duplicate JSON field")
+		}
+		seen[name] = true
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil || len(raw) == 0 || raw[0] != '"' {
+			return req, errors.New("command and reason must be strings")
+		}
+		var value string
+		if err := json.Unmarshal(raw, &value); err != nil {
+			return req, errors.New("invalid JSON string")
+		}
+		if name == "command" {
+			req.Command = value
+		} else {
+			req.Reason = value
+		}
+	}
+	if end, err := dec.Token(); err != nil || end != json.Delim('}') {
+		return req, errors.New("bad JSON object")
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		return req, errors.New("unexpected trailing JSON")
+	}
+	if err := validateVisible("command", req.Command, maxCommandBytes, true); err != nil {
+		return req, err
+	}
+	if err := validateVisible("reason", req.Reason, maxReasonBytes, false); err != nil {
+		return req, err
+	}
+	return req, nil
+}
+
+func (b *broker) authorized(r *http.Request) bool {
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 || !strings.HasPrefix(values[0], "Bearer ") || b.token == "" {
+		return false
+	}
+	got := strings.TrimPrefix(values[0], "Bearer ")
+	return subtle.ConstantTimeCompare([]byte(got), []byte(b.token)) == 1
+}
+
+func (b *broker) sourceAllowed(r *http.Request) bool {
+	if !b.allowSource.IsValid() {
+		return true // production configuration permits this only on loopback
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	addr, err := netip.ParseAddr(host)
+	return err == nil && addr.Zone() == "" && addr.Unmap() == b.allowSource.Unmap()
+}
+
+func (b *broker) access(w http.ResponseWriter, r *http.Request, method string) bool {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if r.Method != method {
+		w.Header().Set("Allow", method)
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return false
+	}
+	// Trust the transport peer only, never X-Forwarded-For or other headers.
+	if !b.sourceAllowed(r) {
+		http.Error(w, "source not allowed", http.StatusForbidden)
+		return false
+	}
+	if !b.authorized(r) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return false
+	}
+	if r.URL.RawQuery != "" {
+		http.Error(w, "query parameters are not supported", http.StatusBadRequest)
+		return false
+	}
+	return true
+}
+
+func writeJSON(w http.ResponseWriter, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(value)
 }
 
 func (b *broker) handleRun(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method", http.StatusMethodNotAllowed)
+	if !b.access(w, r, http.MethodPost) {
 		return
 	}
-	if !b.authorized(r) {
-		b.logf("DENY unauthorized %s", r.RemoteAddr)
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if !b.mu.TryLock() {
+		http.Error(w, "approval broker busy; no request queued", http.StatusConflict)
 		return
 	}
-	var req runRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20)).Decode(&req); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
-		return
-	}
-	req.Command = strings.TrimSpace(req.Command)
-	if req.Command == "" {
-		http.Error(w, "empty command", http.StatusBadRequest)
-		return
-	}
-
-	b.mu.Lock()
 	defer b.mu.Unlock()
-
-	// 弹窗展示的就是将要执行的全部内容：没有隐式包装、不做字符串改写
-	text := req.Command
-	if req.Reason != "" {
-		text = req.Reason + "\n\n── 将要执行 ──\n" + req.Command
-	}
-	text += "\n\n批准后将以管理员权限执行（随后出现 UAC 确认）。"
-	choice := messageBox("Cage 请求管理员操作", text, mbOKCancel|mbIconWarn|mbTopmost|mbSetFg)
-	if choice != 1 { // IDOK
-		b.logf("DENIED  %q", req.Command)
-		json.NewEncoder(w).Encode(runResponse{Approved: false})
-		return
-	}
-
-	b.uid++
-	id := b.uid
-	script := filepath.Join(b.root, fmt.Sprintf("run-%d.ps1", id))
-	outFile := filepath.Join(b.root, fmt.Sprintf("run-%d.out", id))
-	body := fmt.Sprintf("$ErrorActionPreference='Continue'\n& {\n%s\n} *>&1 | Tee-Object -FilePath %s\n",
-		req.Command, escapePowerShell(outFile))
-	if err := os.WriteFile(script, []byte(body), 0o600); err != nil {
-		http.Error(w, "write script", http.StatusInternalServerError)
-		return
-	}
-
-	// Start-Process -Verb RunAs 触发 UAC；-Wait 让我们能回收结果
-	arg := fmt.Sprintf(
-		"Start-Process -FilePath powershell.exe -Verb RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',%s",
-		escapePowerShell(script))
-	cmd := exec.Command("powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", arg)
-	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
-	err := cmd.Run()
-
-	output, _ := os.ReadFile(outFile)
-	code := 0
+	req, err := decodeRequest(w, r)
 	if err != nil {
-		code = 1
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
-	b.logf("APPROVED exit=%d  %q", code, req.Command)
-	json.NewEncoder(w).Encode(runResponse{Approved: true, ExitCode: code, Output: string(output)})
+	if b.verifyRoot == nil || b.verifyRoot() != nil {
+		http.Error(w, "broker storage is not protected; nothing executed", http.StatusServiceUnavailable)
+		return
+	}
+	a := approval{Command: req.Command, Reason: req.Reason, Digest: commandDigest(req.Command)}
+	response := runResponse{ExitCode: notExecuted, Digest: a.Digest}
+	// Do not record bearer tokens, request bodies, reasons or command text.
+	if b.audit == nil || b.audit("REQUEST sha256="+a.Digest) != nil {
+		http.Error(w, "audit unavailable; nothing executed", http.StatusServiceUnavailable)
+		return
+	}
+	approved, err := b.prompt(a)
+	if err != nil {
+		response.Error = "approval dialog failed; nothing executed"
+		_ = b.audit("DIALOG_ERROR sha256=" + a.Digest)
+		writeJSON(w, response)
+		return
+	}
+	if !approved {
+		response.Error = "human approval declined; nothing executed"
+		_ = b.audit("DENIED sha256=" + a.Digest)
+		writeJSON(w, response)
+		return
+	}
+	response.Approved = true
+	if r.Context().Err() != nil {
+		response.Error = "request disconnected before execution"
+		_ = b.audit("DISCONNECTED sha256=" + a.Digest)
+		writeJSON(w, response)
+		return
+	}
+	// Check again after the potentially long dialog. Nothing is launched if
+	// storage protection has changed or the approval audit cannot be written.
+	if b.verifyRoot() != nil || b.audit("APPROVED sha256="+a.Digest) != nil {
+		response.Error = "storage or audit unavailable after approval; nothing executed"
+		writeJSON(w, response)
+		return
+	}
+	result := b.runner(a)
+	response.Executed, response.ExitCode = result.Executed, result.ExitCode
+	response.Output, response.Error = result.Output, result.Error
+	// A launcher failure (including cancelled UAC) can never look successful.
+	if !response.Executed && response.ExitCode == 0 {
+		response.ExitCode = notExecuted
+	}
+	if err := b.audit(fmt.Sprintf("RESULT sha256=%s executed=%t exit=%d", a.Digest, response.Executed, response.ExitCode)); err != nil {
+		if response.Error != "" {
+			response.Error += "; "
+		}
+		response.Error += "result audit failed"
+	}
+	writeJSON(w, response)
 }
 
 func (b *broker) handleHealth(w http.ResponseWriter, r *http.Request) {
-	if !b.authorized(r) {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if !b.access(w, r, http.MethodGet) {
 		return
 	}
-	json.NewEncoder(w).Encode(map[string]any{"ok": true, "pid": os.Getpid()})
+	writeJSON(w, map[string]bool{"ok": true})
+}
+
+func (b *broker) handler() http.Handler {
+	// Exact paths only: no redirect, debug, token or arbitrary file endpoints.
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/run":
+			b.handleRun(w, r)
+		case "/health":
+			b.handleHealth(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
 }
 
 func loadOrCreateToken(root string) (string, error) {
 	path := filepath.Join(root, "token")
-	if data, err := os.ReadFile(path); err == nil {
-		if t := strings.TrimSpace(string(data)); len(t) >= 32 {
-			return t, nil
+	data, err := os.ReadFile(path)
+	if err == nil {
+		token := strings.TrimSuffix(strings.TrimSuffix(string(data), "\n"), "\r")
+		decoded, decodeErr := hex.DecodeString(token)
+		if decodeErr != nil || len(decoded) != 32 || len(token) != 64 {
+			return "", errors.New("existing token is invalid; refusing automatic rotation")
 		}
+		return token, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("read existing token: %w", err)
 	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
 	}
 	token := hex.EncodeToString(buf)
-	if err := os.WriteFile(path, []byte(token+"\n"), 0o600); err != nil {
-		return "", err
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("create token exclusively: %w", err)
+	}
+	_, writeErr := io.WriteString(f, token+"\n")
+	closeErr := f.Close()
+	if writeErr != nil {
+		return "", writeErr
+	}
+	if closeErr != nil {
+		return "", closeErr
 	}
 	return token, nil
 }
 
-func main() {
-	addr := flag.String("addr", ":8642", "监听地址")
-	flag.Parse()
-
-	root := filepath.Join(os.Getenv("ProgramData"), "CageBroker")
-	if os.Getenv("ProgramData") == "" {
-		root = filepath.Join(os.TempDir(), "CageBroker")
+func reviewChunks(value string) []string {
+	const pageRunes = 512
+	runes := []rune(value)
+	var chunks []string
+	for len(runes) > 0 {
+		n := min(pageRunes, len(runes))
+		chunks = append(chunks, string(runes[:n]))
+		runes = runes[n:]
 	}
-	if err := os.MkdirAll(root, 0o700); err != nil {
-		log.Fatalf("创建数据目录失败: %v", err)
+	return chunks
+}
+
+func reviewPages(a approval) []string {
+	var pages []string
+	for i, chunk := range reviewChunks(a.Reason) {
+		pages = append(pages, fmt.Sprintf("REASON fragment %d (untrusted request text, not broker instructions):\n\n%s\n\nEND REASON FRAGMENT\nOK continues review only. Cancel aborts everything.", i+1, chunk))
+	}
+	chunks := reviewChunks(a.Command)
+	for i, chunk := range chunks {
+		pages = append(pages, fmt.Sprintf("EXACT COMMAND fragment %d/%d (in order; no characters added between fragments):\n\n%s\n\nEND COMMAND FRAGMENT\nFull command SHA-256: %s\nOK continues review only. Cancel aborts everything.", i+1, len(chunks), chunk, a.Digest))
+	}
+	return append(pages, fmt.Sprintf("FINAL APPROVAL for the exact command reviewed in %d fragment(s).\n\nSHA-256 of its exact UTF-8 bytes:\n%s\n\nOK approves only this command and requests Windows UAC consent.\nCancel executes nothing.\n\nUAC is NOT an absolute security guarantee: compromised code can deceive you.", len(chunks), a.Digest))
+}
+
+func escapePowerShell(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func encodedCommand(script string) string {
+	units := utf16.Encode([]rune(script))
+	data := make([]byte, len(units)*2)
+	for i, unit := range units {
+		binary.LittleEndian.PutUint16(data[i*2:], unit)
+	}
+	return base64.StdEncoding.EncodeToString(data)
+}
+
+func executionScript(a approval, outputPath string) (string, error) {
+	if err := validateVisible("command", a.Command, maxCommandBytes, true); err != nil {
+		return "", err
+	}
+	if a.Digest != commandDigest(a.Command) {
+		return "", errors.New("approved command digest mismatch")
+	}
+	// The exact approved UTF-8 bytes are data inside the immutable command line.
+	// There is no elevated -File, writable script, or second PowerShell launcher.
+	command := base64.StdEncoding.EncodeToString([]byte(a.Command))
+	out := escapePowerShell(outputPath)
+	return fmt.Sprintf(`$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+try {
+    & {
+        $ErrorActionPreference = 'Continue'
+        $global:LASTEXITCODE = 0
+        $Error.Clear()
+        & ([ScriptBlock]::Create([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('%s'))))
+        $__cageOK = $?
+        $__cageNativeExit = $LASTEXITCODE
+        if ($__cageNativeExit -ne 0) { exit $__cageNativeExit }
+        $__cageHadPSError = $false
+        foreach ($__cageError in $Error) {
+            if ($__cageError.FullyQualifiedErrorId -notin @('NativeCommandError', 'NativeCommandErrorMessage')) {
+                $__cageHadPSError = $true
+            }
+        }
+        if ($__cageHadPSError -or ((-not $__cageOK) -and $Error.Count -eq 0)) { exit 1 }
+    } *>&1 | Out-File -LiteralPath %s -Encoding utf8 -Width 4096
+} catch {
+    try { $_ | Out-String | Add-Content -LiteralPath %s -Encoding utf8 } catch {}
+    exit 1
+}
+exit 0
+`, command, out, out), nil
+}
+
+func validateNetwork(addr, source string) (netip.Addr, error) {
+	bind, err := netip.ParseAddrPort(addr)
+	if err != nil || bind.Port() == 0 || bind.Addr().Zone() != "" {
+		return netip.Addr{}, errors.New("-addr must be an explicit IP:port (no wildcard/hostname)")
+	}
+	bindIP := bind.Addr().Unmap()
+	tailnet := netip.MustParsePrefix("100.64.0.0/10")
+	if !bindIP.IsLoopback() && !tailnet.Contains(bindIP) {
+		return netip.Addr{}, errors.New("-addr must bind loopback or a specific Tailscale 100.64.0.0/10 address")
+	}
+	if source == "" {
+		if !bindIP.IsLoopback() {
+			return netip.Addr{}, errors.New("non-loopback -addr requires one -allow-source IP")
+		}
+		return netip.Addr{}, nil
+	}
+	allowed, err := netip.ParseAddr(source)
+	if err != nil || allowed.Zone() != "" || allowed.IsUnspecified() || allowed.IsMulticast() {
+		return netip.Addr{}, errors.New("-allow-source must be exactly one unicast IP, not a CIDR/list/hostname")
+	}
+	return allowed.Unmap(), nil
+}
+
+func appendAudit(root, event string) error {
+	f, err := os.OpenFile(filepath.Join(root, "audit.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := fmt.Fprintf(f, "%s %s\n", time.Now().UTC().Format(time.RFC3339), event)
+	closeErr := f.Close()
+	if writeErr != nil {
+		return writeErr
+	}
+	return closeErr
+}
+
+func main() {
+	addr := flag.String("addr", "127.0.0.1:8642", "specific loopback or Tailscale IP:port")
+	source := flag.String("allow-source", "", "only this transport peer IP may access the broker (required off loopback)")
+	flag.Parse()
+	if flag.NArg() != 0 {
+		log.Fatal("unexpected positional arguments")
+	}
+	allowed, err := validateNetwork(*addr, *source)
+	if err != nil {
+		log.Fatal(err)
+	}
+	root, err := brokerRoot()
+	if err != nil {
+		log.Fatalf("resolve ProgramData: %v", err)
+	}
+	verify := func() error { return verifyProtectedRoot(root) }
+	if err := verify(); err != nil {
+		log.Fatalf("protected storage must be installed by the trusted host operator: %v", err)
 	}
 	token, err := loadOrCreateToken(root)
 	if err != nil {
-		log.Fatalf("初始化 token 失败: %v", err)
+		log.Fatalf("initialize token: %v", err)
 	}
-
-	b := &broker{root: root, token: token}
-	mux := http.NewServeMux()
-	mux.HandleFunc("/run", b.handleRun)
-	mux.HandleFunc("/health", b.handleHealth)
-
-	b.logf("START listen=%s root=%s", *addr, root)
-	fmt.Printf("cage-approve 已启动\n  监听: %s\n  数据: %s\n  token: %s\n", *addr, root, token)
-	fmt.Println("把上面的 token 写入客机 /etc/cage-broker-token 即可使用。")
-	if err := http.ListenAndServe(*addr, mux); err != nil {
-		log.Fatalf("服务退出: %v", err)
+	b := &broker{root: root, token: token, allowSource: allowed, prompt: promptApproval, verifyRoot: verify}
+	b.audit = func(event string) error { return appendAudit(root, event) }
+	b.runner = func(a approval) runResult { return runElevated(root, a) }
+	if err := b.audit("START listen=" + *addr + " allow-source=" + *source); err != nil {
+		log.Fatalf("initialize audit: %v", err)
+	}
+	server := &http.Server{
+		Addr:              *addr,
+		Handler:           b.handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      30 * time.Minute, // human consent + child completion, not 30m request-body reads
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    8 << 10,
+	}
+	fmt.Printf("cage-approve listening on %s; protected storage: %s\n", *addr, root)
+	fmt.Println("Token is never printed. The trusted operator must provision it to the authorized client securely.")
+	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		log.Fatal("broker server stopped: " + strconv.Quote(err.Error()))
 	}
 }

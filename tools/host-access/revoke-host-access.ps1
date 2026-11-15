@@ -12,7 +12,7 @@ if (-not [Environment]::Is64BitProcess) {
     $forward=@{UserName=$UserName;AlreadyRelaunched=$true;RemoveUser=[bool]$RemoveUser}
     $params=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes([Management.Automation.PSSerializer]::Serialize($forward)))
     $path="'"+$PSCommandPath.Replace("'","''")+"'"
-    $code='$p=[Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('''+$params+'''))); & '+$path+' @p; exit $LASTEXITCODE'
+    $code='$ProgressPreference=''SilentlyContinue'';$p=[Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('''+$params+'''))); & '+$path+' @p 6>&1 | ForEach-Object {[string]$_}; exit $LASTEXITCODE'
     & $x64 -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -InputFormat Text -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)))
     exit $LASTEXITCODE
 }

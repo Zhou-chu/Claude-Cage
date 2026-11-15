@@ -29,7 +29,7 @@ if (-not [Environment]::Is64BitProcess) {
     $serialized = [Management.Automation.PSSerializer]::Serialize($forward)
     $encodedParams = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($serialized))
     $literalPath = "'" + $PSCommandPath.Replace("'", "''") + "'"
-    $code = '$p=[Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''' + $encodedParams + '''))); & ' + $literalPath + ' @p; exit $LASTEXITCODE'
+    $code = '$ProgressPreference=''SilentlyContinue'';$p=[Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(''' + $encodedParams + '''))); & ' + $literalPath + ' @p 6>&1 | ForEach-Object {[string]$_}; exit $LASTEXITCODE'
     Write-Host 'Switching to 64-bit Windows PowerShell...'
     & $x64 -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -InputFormat Text -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)))
     exit $LASTEXITCODE
