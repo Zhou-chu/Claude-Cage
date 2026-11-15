@@ -41,7 +41,7 @@ Cage的tailnet是userspace网络，不能把没有`tailscale0`当成故障，也
 
 安装器还会配置标准OpenSSH别名`windows-host`，直接使用Cage内置的`cage-tailnet dial`传输，不依赖审批代理。它固定宿主用户、私钥和已独立核对的主机键；保留Cage自动维护的私网Include与用户其他SSH规则。首次原配置备份和使用说明存放在客机`~/.config/cage-host/`，新增配置通过真实`ssh -G`解析后才写入。
 
-Claude Desktop服务与Cage终端都使用客机账号`cage`。在有终端能力的模式下，可直接执行下列命令；这不代表纯聊天模式自动拥有命令执行工具，也不提供桌面鼠标控制。
+Claude Desktop服务与Cage终端都使用客机账号`cage`，但**Desktop会话的代码执行工具可能运行在云端**，并不共享客机的程序、SSH别名或网络。下面命令只适用于客机本地终端；不能用其测试冒充Desktop云端工具已经接通。云端会话须使用下文的本地MCP桥接，也不因此获得桌面鼠标控制。
 
 客机使用：
 
@@ -60,6 +60,35 @@ printf '%s\n' '{"reason":"查看宿主系统版本","command":"Get-ComputerInfo 
 原有`cage-host ssh`封装使用严格主机键检查、固定身份文件、公钥认证和一次连接，不继承用户SSH配置、代理跳转或连接复用。标准`ssh windows-host`则保留用户原规则，以置顶的宿主专用段固定传输、身份和主机键校验，并关闭代理转发及连接复用。主机键变更会拒绝；请独立核对后重跑部署器，不要关闭校验。
 
 客户端由系统Python3标准库实现；不安装第三方库。配置和令牌为0600，拒绝不安全权限、符号链接和非本用户/非root拥有的私有文件。具体客户端协议与测试见`guest/README.md`。
+
+## Claude Desktop云端会话：本地MCP桥接
+
+客机终端能SSH，不代表Desktop的云端代码执行环境也能。若它报告没有`ssh`、`sftp`或PowerShell，应使用本地MCP工具，不要让它在云端安装客户端或复制私钥。
+
+```powershell
+# 普通宿主PowerShell；显式选择合并Desktop工具配置
+.\install-guest-access.ps1 -ConfigureDesktop
+```
+
+仅合并客机`~/.config/Claude/claude_desktop_config.json`中的`mcpServers.cage_ssh`；其他设置/服务器保留，原配置备份在私有客户端目录。权限不安全、JSON损坏或同名陌生服务器时停止，不重置。脚本不读取聊天、Cookie、密钥环或登录存储，也不重启Desktop。先保存当前工作，再按需手动重开Desktop加载工具，不退出账号、不重启整个Cage。
+
+让Claude**调用工具**`cage_ssh_targets`，再调用`cage_ssh_execute`，例如参数：
+
+```json
+{"target":"windows-host","shell":"powershell","command":"whoami; Get-Location","timeout_seconds":30}
+```
+
+工具由客机本地系统Python运行，只访问显式登记且已授权的SSH目标；默认仅`windows-host`，不提供管理员代理调用。新增设备必须独立授权公钥、核对主机键后，才可通过私有`mcp_targets.json`登记相应客户端配置。Tailscale在线不代表已授权。
+
+服务端单元/协议测试及单独启动的真实MCP→SSH验证，不等于Desktop应用已加载工具。必须由Desktop实际工具调用确认，不能再用云端Shell执行`ssh`测试替代。详细提示在客机`~/.config/cage-host/DESKTOP-SSH.md`。长构建应在宿主记录日志并查询状态；超时或截断可能代表结果未知，不自动重试。
+
+## 新Windows设备的一次性授权
+
+`enroll-windows-peer.ps1`与`host-access-common.ps1`放在一起，在**目标电脑本人管理员PowerShell**运行。参数为客机公钥、客机/目标tailnet IPv4、目标Windows计算机名和专用标准用户名。先加`-CheckOnly`只读预检，再去掉此开关应用。脚本会以计算机名阻止误在其他设备执行；需要已有运行中的sshd，不安装VPN或SSH、不改防火墙、不安装审批代理。
+
+新账号先禁用，只有公钥ACL、有效SSH规则和sshd重启成功后才启用；已有密码不重置，陌生公钥或管理员账号不覆盖。失败会禁用本次新建账号。成功后只输出公开Ed25519主机键和SHA256指纹，不读私钥。
+
+本人从目标电脑回传并核对公开主机键后，才能固定到独立known_hosts、配置该设备的客户端配置并登记MCP目标，再实测非管理员SSH。不要将台式机审批令牌复用到其他设备；无审批代理的SSH专用配置应使用独立不存在的broker令牌路径，使误调用代理失败。在线、端口可达、脚本单元测试通过均不等于真实设备授权已完成。
 
 ## 审批与失败语义
 

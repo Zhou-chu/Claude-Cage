@@ -150,7 +150,7 @@ def install():
         raise
     store(root / "USAGE.md", usage(config).encode("utf-8"))
     print("Configured native ssh/sftp alias: windows-host (Cage built-in Tailscale transport).")
-    print("Guest instructions: ~/.config/cage-host/USAGE.md; no Desktop settings or credentials modified.")
+    print("Native SSH instructions: ~/.config/cage-host/USAGE.md; this step does not access Desktop/session data.")
 
 
 if __name__ == "__main__":

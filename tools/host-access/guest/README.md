@@ -20,6 +20,29 @@ candidate before installation. Full guest usage is in
 Desktop-tool boundaries. This does not modify Claude Desktop settings/login,
 start services, or submit approval requests. Importing the module has no effects.
 
+## Claude Desktop local MCP bridge
+
+Desktop's cloud code-execution tools do not share the guest shell, binaries or
+SSH aliases. Opt in with the host installer's `-ConfigureDesktop` switch; it
+merges only the local `mcpServers.cage_ssh` entry using `cage_desktop_ssh_setup.py`,
+backs up the original privately, preserves other settings and never restarts the
+Desktop or touches login/chat stores. A conflicting server name fails closed.
+
+`cage_host_mcp.py` runs beside `cage_host.py` via system Python `-I`, with bounded
+newline JSON-RPC stdio. Its tools are `cage_ssh_targets` (authorized metadata,
+not an online claim) and `cage_ssh_execute` (one SSH command as the target account,
+PowerShell or native shell). It exposes no broker/admin method. Only explicitly
+registered, independently pinned targets are usable; absent private registry
+means only `windows-host`. The registry schema is
+`{"version":1,"targets":{"alias":"~/private/client-config.json"}}`.
+
+Both streams are bounded to 128KiB and timeouts to 120 seconds; timeout, transport
+failure or truncation means unknown execution outcome with no automatic retry.
+Long builds should write host-side logs and be polled in separate short calls.
+Protocol/guest smoke tests are NOT proof that Desktop loaded the tool: save work,
+manually reopen Desktop if needed, enable the local server, then make a real
+`cage_ssh_execute` call. Do not run `ssh` in the cloud shell as a substitute.
+
 ## Protocol verified in this checkout
 
 The implementation was derived from these sources, not a `--help` probe:

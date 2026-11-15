@@ -5,7 +5,8 @@ param(
     [string]$CageExe,
     [string]$UserName = 'cageops',
     [int]$BrokerPort = 8642,
-    [string]$BrokerAddress
+    [string]$BrokerAddress,
+    [switch]$ConfigureDesktop
 )
 $ErrorActionPreference='Stop'
 if (-not [Environment]::Is64BitProcess) {
@@ -42,10 +43,11 @@ $tokenPath=Join-Path $env:ProgramData 'CageBroker\token'
 $token=[IO.File]::ReadAllText($tokenPath).Trim()
 if($token -notmatch '^[a-f0-9]{64}$'){throw 'Invalid broker token file (contents withheld).'}
 $files=@{}
-foreach($name in @('cage-host','cage_host.py','cage_host_native.py')) {
+foreach($name in @('cage-host','cage_host.py','cage_host_native.py','cage_host_mcp.py','cage_desktop_ssh_setup.py')) {
     $files[$name]=[Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $PSScriptRoot "guest\$name")))
 }
 $payload=@{
+    configure_desktop=[bool]$ConfigureDesktop
     files=$files
     config=@{
         version=1;host=$BrokerAddress;ssh_user=$UserName;ssh_port=22;broker_port=$BrokerPort
@@ -77,13 +79,15 @@ def store(path,data,mode):
     finally:
         if os.path.exists(name): os.unlink(name)
 for name,data in p['files'].items():
-    if name not in ('cage-host','cage_host.py','cage_host_native.py'): raise RuntimeError('unexpected install member')
+    if name not in ('cage-host','cage_host.py','cage_host_native.py','cage_host_mcp.py','cage_desktop_ssh_setup.py'): raise RuntimeError('unexpected install member')
     store(home/'.local/bin'/name,base64.b64decode(data),0o700)
 root=home/'.config/cage-host'
 store(root/'config.json',json.dumps(p['config']).encode(),0o600)
 store(root/'token',p['token'].encode(),0o600)
 store(root/'known_hosts',p['hostkey'].encode(),0o600)
 subprocess.run(['/usr/bin/python3','-I',str(home/'.local/bin/cage_host_native.py')],check=True)
+if p.get('configure_desktop'):
+    subprocess.run(['/usr/bin/python3','-I',str(home/'.local/bin/cage_desktop_ssh_setup.py')],check=True)
 print('Installed ~/.local/bin/cage-host; private config/token; independently pinned host key.')
 '@
 $encoded=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($payload|ConvertTo-Json -Compress -Depth 5)))
