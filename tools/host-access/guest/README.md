@@ -38,6 +38,9 @@ means only `windows-host`. The registry schema is
 
 Both streams are bounded to 128KiB and timeouts to 120 seconds; timeout, transport
 failure or truncation means unknown execution outcome with no automatic retry.
+PowerShell output objects are formatted and synchronously written per item, so
+`Get-Location`/custom objects are not lost when the wrapper or user script exits.
+Producer error/native exit status is retained separately from formatter status.
 Long builds should write host-side logs and be polled in separate short calls.
 Protocol/guest smoke tests are NOT proof that Desktop loaded the tool: save work,
 manually reopen Desktop if needed, enable the local server, then make a real

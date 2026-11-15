@@ -126,9 +126,18 @@ try {
     $ErrorActionPreference = 'Continue'
     $global:LASTEXITCODE = 0
     $Error.Clear()
-    & ([ScriptBlock]::Create(%s))
-    $__cageOK = $?
-    $__cageNativeExit = $LASTEXITCODE
+    $__cageState = @{ OK = $true; NativeExit = 0 }
+    & {
+        & ([ScriptBlock]::Create(%s))
+        $__cageState.OK = $?
+        $__cageState.NativeExit = $LASTEXITCODE
+    } | ForEach-Object {
+        # Finish each object's formatting before producer exit can stop the host.
+        # A shared object retains producer status across the pipeline scopes.
+        [Console]::Write(($_ | Out-String -Width 240))
+    }
+    $__cageOK = $__cageState.OK
+    $__cageNativeExit = $__cageState.NativeExit
     if ($__cageNativeExit -ne 0) { exit $__cageNativeExit }
     $__cageHadPSError = $false
     foreach ($__cageError in $Error) {

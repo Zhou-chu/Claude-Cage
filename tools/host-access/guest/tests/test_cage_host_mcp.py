@@ -591,6 +591,10 @@ class LocalPowerShellFixtureTests(unittest.TestCase):
         fixtures = [
             ("Write-Output 'fixture success'", 0, "fixture success"),
             ("Write-Output '你好 fixture'", 0, "你好 fixture"),
+            ("Write-Output 'location fixture'; Get-Location", 0, str(Path.cwd())),
+            ("[pscustomobject]@{Probe='STRUCTURED_FIXTURE';Number=42}", 0, "STRUCTURED_FIXTURE"),
+            ("[pscustomobject]@{Probe='BEFORE_EXPLICIT_EXIT'}; exit 19", 19, "BEFORE_EXPLICIT_EXIT"),
+            ("Get-Location; cmd.exe /d /c exit 29", 29, str(Path.cwd())),
             ("cmd.exe /d /c exit 7", 7, ""),
             ("cmd.exe /d /c exit 23; Write-Output 'after native'", 23, "after native"),
             ("Write-Output 'before exit'; exit 19", 19, "before exit"),
