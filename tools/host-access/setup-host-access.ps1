@@ -105,22 +105,24 @@ if (-not (Test-Path $profileDir)) {
     Write-Host "   已创建用户目录 $profileDir。"
 }
 
-$sshDir = Join-Path $profileDir '.ssh'
-New-Item -ItemType Directory -Path $sshDir -Force | Out-Null
-$keyFile = Join-Path $sshDir 'authorized_keys'
+# 账号从未交互登录过时 Windows 不注册用户配置文件，sshd 解析不到家目录下的
+# authorized_keys。因此公钥写到系统级绝对路径，并在 sshd_config 里用
+# Match User 显式指向它——不依赖家目录解析。
+$keyDir = Join-Path $env:ProgramData 'ssh'
+$keyFile = Join-Path $keyDir "cageops_authorized_keys"
 $keyLine = $GuestPublicKey.Trim()
 $current = if (Test-Path $keyFile) { @(Get-Content $keyFile) } else { @() }
 if ($current -notcontains $keyLine) {
     @($current | Where-Object { $_ -ne '' }) + $keyLine | Set-Content -Path $keyFile -Encoding ascii
-    Write-Host '   已写入公钥。'
+    Write-Host "   已写入公钥到 $keyFile"
 } else {
     Write-Host '   公钥已存在。'
 }
 
-& icacls.exe $sshDir /inheritance:r /grant "${UserName}:(OI)(CI)F" /grant 'SYSTEM:(OI)(CI)F' /grant 'Administrators:(OI)(CI)F' | Out-Null
-& icacls.exe $keyFile /inheritance:r /grant "${UserName}:F" /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
+# sshd 要求该文件只能由 SYSTEM/Administrators 写入
+& icacls.exe $keyFile /inheritance:r /grant 'SYSTEM:F' /grant 'Administrators:F' | Out-Null
 $acl = Get-Acl $keyFile
-$acl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, $UserName)))
+$acl.SetOwner((New-Object System.Security.Principal.NTAccount($env:COMPUTERNAME, 'Administrators')))
 Set-Acl -Path $keyFile -AclObject $acl
 Write-Host '   权限已收紧。'
 
@@ -141,6 +143,31 @@ if ($content -match '(?m)^\s*AllowUsers\s') {
     $entry = "`r`n# Cage: dedicated standard user, fixed tailnet source only`r`nAllowUsers $allowLine`r`n"
     Add-Content -Path $sshdConfig -Value $entry -Encoding ascii
     Write-Host "   已添加 AllowUsers $allowLine"
+}
+
+# Match 块必须插在已有的 Match 块之前：sshd 的 Match 会一直生效到下一个 Match 或行尾
+$matchBlock = @(
+    "# Cage: absolute key path, does not depend on profile resolution"
+    "Match User $UserName"
+    "    AuthorizedKeysFile __PROGRAMDATA__/ssh/cageops_authorized_keys"
+)
+if ($content -match ('(?m)^\s*Match\s+User\s+' + [regex]::Escape($UserName))) {
+    Write-Host '   已存在该用户的 Match User 块，跳过。'
+} else {
+    $lines = @(Get-Content $sshdConfig)
+    $insertAt = -1
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match '^\s*Match\s+Group\s+administrators') { $insertAt = $i; break }
+    }
+    if ($insertAt -ge 0) {
+        $before = $lines[0..($insertAt - 1)]
+        $after = $lines[$insertAt..($lines.Count - 1)]
+        $merged = @($before) + $matchBlock + @('') + @($after)
+        Set-Content -Path $sshdConfig -Value $merged -Encoding ascii
+    } else {
+        Add-Content -Path $sshdConfig -Value ("`r`n" + ($matchBlock -join "`r`n") + "`r`n") -Encoding ascii
+    }
+    Write-Host '   已添加 Match User 块（绝对公钥路径）。'
 }
 
 $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue

@@ -60,7 +60,16 @@ if (Test-Path $keyFile) {
 Step '2/4 移除 sshd 白名单'
 $sshdConfig = Join-Path $env:ProgramData 'ssh\sshd_config'
 if (Test-Path $sshdConfig) {
-    $lines = Get-Content $sshdConfig | Where-Object { $_ -notmatch ('^\s*AllowUsers\s+.*' + [regex]::Escape($UserName) + '@') }
+    $drop = @(
+        ('^\s*AllowUsers\s+.*' + [regex]::Escape($UserName) + '@'),
+        '^\s*#\s*Cage: absolute key path',
+        ('^\s*Match\s+User\s+' + [regex]::Escape($UserName) + '\s*$'),
+        '^\s*AuthorizedKeysFile\s+__PROGRAMDATA__/ssh/cageops_authorized_keys\s*$'
+    )
+    $lines = Get-Content $sshdConfig | Where-Object {
+        $line = $_
+        -not ($drop | Where-Object { $line -match $_ })
+    }
     Set-Content -Path $sshdConfig -Value $lines -Encoding ascii
     $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction SilentlyContinue
     if ($service) {
@@ -74,6 +83,10 @@ if (Test-Path $sshdConfig) {
         }
     }
 }
+
+# 同时删除系统级公钥文件
+$sysKey = Join-Path $env:ProgramData 'ssh\cageops_authorized_keys'
+if (Test-Path $sysKey) { Remove-Item $sysKey -Force; Write-Host '   已删除系统级公钥文件。' }
 
 Step '3/4 移除防火墙规则与登录自启'
 & netsh.exe advfirewall firewall delete rule "name=Cage approval broker" | Out-Null
