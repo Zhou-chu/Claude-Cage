@@ -84,7 +84,11 @@ printf '%s\n' '{"reason":"查看宿主系统版本","command":"Get-ComputerInfo 
 
 ## 新Windows设备的一次性授权
 
-`enroll-windows-peer.ps1`与`host-access-common.ps1`放在一起，在**目标电脑本人管理员PowerShell**运行。参数为客机公钥、客机/目标tailnet IPv4、目标Windows计算机名和专用标准用户名。先加`-CheckOnly`只读预检，再去掉此开关应用。脚本会以计算机名阻止误在其他设备执行；需要已有运行中的sshd，不安装VPN或SSH、不改防火墙、不安装审批代理。
+`enroll-windows-peer.ps1`、`host-access-common.ps1`与`sshd-system-validation.ps1`放在一起，在**目标电脑本人管理员PowerShell**运行。参数为客机公钥、客机/目标tailnet IPv4、目标Windows计算机名和专用标准用户名。必须显式加`-UseSystemValidation`授权一次性、固定用途的SYSTEM配置校验；先加`-CheckOnly`预检，再去掉此开关应用。脚本会以计算机名阻止误在其他设备执行；需要已有以LocalSystem运行的sshd，不安装VPN或SSH、不改防火墙、不安装审批代理。
+
+Windows管理员不等于SYSTEM，不能直接以自身身份让sshd取得另一用户令牌。校验器仅在受保护临时目录保存候选配置，以无触发器的一次性SYSTEM任务运行固定的`sshd -t/-T`检查；任务定义从创建时就使用Administrators所有者和受保护的SYSTEM/Administrators全权DACL，并读回验证，不允许操作者普通身份改写SYSTEM动作，不从桌面加载SYSTEM脚本，不执行任意业务命令。预检不会启用账号、改公钥/活动配置或重启服务，但会创建并清理临时校验文件/任务；成功前必须证明SYSTEM身份、候选哈希、七项策略与任务清理。终止或清理不确定时失败关闭并报告精确保留项，不自动重投。
+
+既有账号的`-CheckOnly`必须真实验证用户上下文，不能再只报告计划；目标仍禁用时如果Windows无法生成识别令牌，预检就停止，不偷启用账号。首次账号不存在时只能报告静态检查，完整SYSTEM校验要在应用创建禁用账号后完成。单元测试和本机非SYSTEM拒绝测试不代替目标设备的真实SYSTEM预检。
 
 新账号先禁用，只有公钥ACL、有效SSH规则和sshd重启成功后才启用；已有密码不重置，陌生公钥或管理员账号不覆盖。组成员检查通过系统原生API的新鲜SID列表完成，不使用ADSI路径比较；添加成员也以SID进行且仅允许内置Users组。公钥ACL核对所有者SID、禁止继承以及三条精确SID/权限掩码，拒绝额外/缺失/继承/拒绝条目或扩大权限；不把NTFS将`D:P`规范化为`D:PAI`等历史标记或无害允许条目排序当作权限变化。成功后只输出公开Ed25519主机键和SHA256指纹，不读私钥。
 

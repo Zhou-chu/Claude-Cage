@@ -28,13 +28,13 @@ Assert ($selfErrors.Count -eq 0) 'Test source parses'
 $bytes = [IO.File]::ReadAllBytes($source)
 Assert (@($bytes | Where-Object { $_ -gt 127 }).Count -eq 0) 'Enrollment source is ASCII'
 $names = @($ast.ParamBlock.Parameters | ForEach-Object { $_.Name.VariablePath.UserPath })
-Assert (($names -join ',') -ceq 'GuestPublicKey,GuestAddress,HostAddress,ExpectedComputerName,UserName,CheckOnly,ResumeFailedEnrollment') 'Exact seven declared parameters; recovery is seventh'
+Assert (($names -join ',') -ceq 'GuestPublicKey,GuestAddress,HostAddress,ExpectedComputerName,UserName,CheckOnly,ResumeFailedEnrollment,UseSystemValidation') 'Exact eight declared parameters; SYSTEM consent is eighth'
 $metadata = New-Object Management.Automation.CommandMetadata (Get-Command -Name $source)
 foreach ($name in @('GuestPublicKey','GuestAddress','HostAddress','ExpectedComputerName')) {
     Assert $metadata.Parameters[$name].ParameterSets['__AllParameterSets'].IsMandatory "$name is mandatory"
 }
 Assert ($ast.ParamBlock.Parameters[4].DefaultValue.Value -ceq 'cageops') 'Default dedicated user'
-foreach ($name in @('CheckOnly','ResumeFailedEnrollment')) {
+foreach ($name in @('CheckOnly','ResumeFailedEnrollment','UseSystemValidation')) {
     Assert ($metadata.Parameters[$name].ParameterType -eq [Management.Automation.SwitchParameter]) "$name switch type"
     Assert ($null -eq $ast.ParamBlock.Parameters[$names.IndexOf($name)].DefaultValue) "$name defaults to false"
 }
@@ -59,6 +59,20 @@ foreach ($check in @($false, $true)) {
 }
 Assert-Rejected { & $source @arguments -UserName 'bad user' } 'Reject unsafe user parameter before execution'
 Assert-Rejected { & $source -GuestPublicKey x -GuestAddress x -HostAddress x -ExpectedComputerName 'bad/name' } 'Reject unsafe expected name'
+# Consent guard is before imports; test it in isolation, never run the enrollment body.
+$consent = @($statements | Where-Object { $_.Extent.Text.StartsWith('if (-not $UseSystemValidation)') })
+Assert ($consent.Count -eq 1) 'Explicit SYSTEM task consent guard exists'
+$UseSystemValidation = $false
+Assert-Rejected { & ([scriptblock]::Create($consent[0].Extent.Text)) } 'Missing consent fails before any import or task'
+$UseSystemValidation = $true
+& ([scriptblock]::Create($consent[0].Extent.Text))
+Assert $true 'Explicit consent passes the inert guard only'
+$preflight = @($statements | Where-Object { $_.Extent.Text.StartsWith('if ($CheckOnly)') })
+Assert ($preflight.Count -eq 1) 'One distinct preflight branch'
+Assert ($preflight[0].Extent.Text.IndexOf('Invoke-CageSshdSystemValidation') -lt $preflight[0].Extent.Text.IndexOf('SYSTEM preflight passed')) 'Real SYSTEM validation precedes preflight success'
+Assert ($preflight[0].Extent.Text.Contains('Account flags changed during preflight') -and $preflight[0].Extent.Text.Contains('Active sshd config changed during preflight')) 'Preflight verifies no account/config mutation'
+$preflightWrites = @($preflight[0].FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -in @('Set-PeerAccountEnabled','Set-Acl','Set-CageSshConfig','Restart-Service') }, $true))
+Assert ($preflightWrites.Count -eq 0) 'Preflight has no key ACL, account-state, config commit or service commands'
 # Load only function ASTs; never execute the enrollment body/import/apply.
 foreach ($name in @('Assert-PeerAddress','Assert-PeerPublicKey','Assert-PeerPlainPath',
     'Initialize-PeerNativeMembership','ConvertFrom-PeerGroupAccount','Resolve-PeerGroupName',
@@ -152,7 +166,7 @@ Assert-Rejected { Assert-CageEffectiveConfig @($effective | Where-Object { $_ -n
 $checkBranch = @($statements | Where-Object { $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$CheckOnly' })
 Assert ($checkBranch.Count -eq 1) 'Single explicit CheckOnly fence'
 $checkCommands = @($checkBranch[0].FindAll({ param($node) $node -is [Management.Automation.Language.CommandAst] }, $true))
-Assert (@($checkCommands | Where-Object { $_.GetCommandName() -ne 'Write-Host' }).Count -eq 0) 'CheckOnly branch contains reporting only'
+Assert (@($checkCommands | Where-Object { $_.GetCommandName() -notin @('Write-Host','Write-Warning','Invoke-CageSshdSystemValidation','Assert-CageEffectiveConfig') }).Count -eq 0) 'CheckOnly permits reporting, fixed SYSTEM validation and policy assertions only'
 Assert ($checkBranch[0].Clauses[0].Item2.Statements[-1] -is [Management.Automation.Language.ReturnStatementAst]) 'CheckOnly returns before apply'
 $apply = @($statements | Where-Object { $_ -is [Management.Automation.Language.TryStatementAst] })
 Assert ($apply.Count -eq 1 -and $apply[0].Extent.StartOffset -gt $checkBranch[0].Extent.EndOffset) 'Apply transaction follows CheckOnly return'
@@ -162,7 +176,7 @@ Assert ($body.Contains('$PSCommandPath.Replace')) 'Relaunch targets generic sour
 Assert ($body.Contains('-ValidateUser $UserName -GuestAddress $GuestAddress')) 'Common transaction receives exact user/source validation context'
 Assert (-not ($body -match '(?i)New-NetFirewallRule|Set-NetFirewallRule|Remove-NetFirewallRule|Add-LocalGroupMember|Start-Process|tailscale\.exe')) 'No firewall, elevation or VPN mutation commands'
 Assert (-not ($body -match 'ADsPath|\.IsMember|Invoke\(''IsMember''|\$users\.Add')) 'No ADSI path-based membership query/add remains'
-Assert ($body.Contains('(-not $CheckOnly -or $ResumeFailedEnrollment)')) 'Recovery CheckOnly also requires explicit administrator token'
+Assert ($body.Contains('(-not $CheckOnly -or $ResumeFailedEnrollment -or $UseSystemValidation)')) 'Recovery and SYSTEM CheckOnly both require explicit administrator token'
 Assert ($body.Contains('$ResumeFailedEnrollment -and -not $exists')) 'Recovery rejects absent accounts before apply'
 Assert ($body.Contains('description is not cryptographic provenance')) 'Physical consent limitation documented in source and preflight'
 Assert ($body.Contains('Existing key file is not exactly compatible.')) 'Existing incompatible dedicated key refusal retained'
@@ -170,28 +184,31 @@ Assert ($body.Contains('Dedicated key ACL verification failed.')) 'Dedicated key
 Assert ($body.Contains('HostAddress is not assigned to this laptop.')) 'Assigned host-IP fence retained'
 # Exercise relaunch serialization against an inert binding target only.
 function Test-SyntheticForward {
-    param([string]$GuestPublicKey, [string]$GuestAddress, [string]$HostAddress, [string]$ExpectedComputerName, [string]$UserName, [switch]$CheckOnly, [switch]$ResumeFailedEnrollment)
-    return [pscustomobject]@{ Bound = $PSBoundParameters; Check = [bool]$CheckOnly; Resume = [bool]$ResumeFailedEnrollment }
+    param([string]$GuestPublicKey, [string]$GuestAddress, [string]$HostAddress, [string]$ExpectedComputerName, [string]$UserName, [switch]$CheckOnly, [switch]$ResumeFailedEnrollment, [switch]$UseSystemValidation)
+    return [pscustomobject]@{ Bound = $PSBoundParameters; Check = [bool]$CheckOnly; Resume = [bool]$ResumeFailedEnrollment; System = [bool]$UseSystemValidation }
 }
 foreach ($check in @($false, $true)) {
     foreach ($resume in @($false, $true)) {
-        $forward = @{
-            GuestPublicKey = ($key + " synthetic 'quoted' comment")
-            GuestAddress = '100.64.0.10'
-            HostAddress = '100.64.0.11'
-            ExpectedComputerName = 'CAGE-SYNTHETIC'
-            UserName = 'synthetic_ops'
-            CheckOnly = [Management.Automation.SwitchParameter]$check
-            ResumeFailedEnrollment = [Management.Automation.SwitchParameter]$resume
-        }
-        $serialized = [Management.Automation.PSSerializer]::Serialize($forward)
-        $encodedParams = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($serialized))
-        $roundTrip = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedParams)))
-        $result = Test-SyntheticForward @roundTrip
-        Assert ($result.Bound.Count -eq 7) 'All seven bound relaunch parameters survive serialization'
-        Assert ($result.Check -eq $check -and $result.Resume -eq $resume) 'Explicit true/false switch values survive relaunch serialization'
-        foreach ($name in @('GuestPublicKey','GuestAddress','HostAddress','ExpectedComputerName','UserName')) {
-            Assert ($result.Bound[$name] -ceq $forward[$name]) 'Relaunch preserves exact string value'
+        foreach ($useSystem in @($false, $true)) {
+            $forward = @{
+                GuestPublicKey = ($key + " synthetic 'quoted' comment")
+                GuestAddress = '100.64.0.10'
+                HostAddress = '100.64.0.11'
+                ExpectedComputerName = 'CAGE-SYNTHETIC'
+                UserName = 'synthetic_ops'
+                CheckOnly = [Management.Automation.SwitchParameter]$check
+                ResumeFailedEnrollment = [Management.Automation.SwitchParameter]$resume
+                UseSystemValidation = [Management.Automation.SwitchParameter]$useSystem
+            }
+            $serialized = [Management.Automation.PSSerializer]::Serialize($forward)
+            $encodedParams = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($serialized))
+            $roundTrip = [Management.Automation.PSSerializer]::Deserialize([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedParams)))
+            $result = Test-SyntheticForward @roundTrip
+            Assert ($result.Bound.Count -eq 8) 'All eight bound relaunch parameters survive serialization'
+            Assert ($result.Check -eq $check -and $result.Resume -eq $resume -and $result.System -eq $useSystem) 'Every explicit true/false consent switch survives relaunch serialization'
+            foreach ($name in @('GuestPublicKey','GuestAddress','HostAddress','ExpectedComputerName','UserName')) {
+                Assert ($result.Bound[$name] -ceq $forward[$name]) 'Relaunch preserves exact string value'
+            }
         }
     }
 }

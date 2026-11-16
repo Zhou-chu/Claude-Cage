@@ -9,7 +9,9 @@ param(
     [ValidatePattern('^[a-z_][a-z0-9_-]{0,30}$')][string]$UserName = 'cageops',
     [switch]$CheckOnly,
     # Physical administrator consent only: the description is not cryptographic provenance.
-    [switch]$ResumeFailedEnrollment
+    [switch]$ResumeFailedEnrollment,
+    # Explicit physical-admin consent for a temporary, fixed SYSTEM validation task.
+    [switch]$UseSystemValidation
 )
 $ErrorActionPreference = 'Stop'
 
@@ -31,7 +33,11 @@ if (-not [Environment]::Is64BitProcess) {
     & $x64 -NoProfile -ExecutionPolicy Bypass -OutputFormat Text -InputFormat Text -EncodedCommand ([Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code)))
     exit $LASTEXITCODE
 }
+if (-not $UseSystemValidation) {
+    throw 'Explicit -UseSystemValidation consent is required for a temporary, fixed SYSTEM sshd validation task. No account/config changes made.'
+}
 . (Join-Path $PSScriptRoot 'host-access-common.ps1')
+. (Join-Path $PSScriptRoot 'sshd-system-validation.ps1')
 # Extend, rather than replace, the common pre-install effective-policy check.
 $commonEffectiveValidator = ${function:Assert-CageEffectiveConfig}
 function Assert-CageEffectiveConfig {
@@ -256,16 +262,19 @@ Assert-PeerAddress $GuestAddress 'GuestAddress'
 Assert-PeerAddress $HostAddress 'HostAddress'
 if ($HostAddress -eq $GuestAddress) { throw 'Guest and host addresses must differ.' }
 Assert-PeerPublicKey $GuestPublicKey
+# Reject unsupported SYSTEM contexts before any account/group/key mutation.
+Assert-CageSsvContext $UserName $GuestAddress 30
 if (-not @(Get-NetIPAddress -AddressFamily IPv4 -IPAddress $HostAddress -ErrorAction Stop).Count) {
     throw 'HostAddress is not assigned to this laptop.'
 }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 if ($UserName -ieq $identity.Name.Split('\')[-1]) { throw 'Dedicated user must not be the current operator.' }
-if ((-not $CheckOnly -or $ResumeFailedEnrollment) -and -not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    throw 'Apply or explicit recovery requires an administrator Windows PowerShell window.'
+if ((-not $CheckOnly -or $ResumeFailedEnrollment -or $UseSystemValidation) -and -not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'SYSTEM validation, apply or explicit recovery requires an administrator Windows PowerShell window.'
 }
 $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
 if (-not $service -or $service.State -ne 'Running') { throw 'An installed, running sshd service is required.' }
+if ($service.StartName -notin @('LocalSystem','NT AUTHORITY\SYSTEM')) { throw 'sshd must run as LocalSystem for identity-matched SYSTEM validation; no service/account changes made.' }
 $sshdExe = Get-CageSshdExe
 # Common helpers use the standard config path. Refuse service overrides rather
 # than changing a config file that this service might not actually load.
@@ -316,12 +325,22 @@ if ($exists) {
     $null = Get-PeerMembership $usersName $userSid
 }
 if ($CheckOnly) {
-    Write-Host 'Read-only preflight passed; no accounts, keys, ACLs, config, firewall or services changed.'
+    if ($exists) {
+        $beforeFlags = [int]$user.UserFlags.Value
+        $effective = @(Invoke-CageSshdSystemValidation -SshdExe $sshdExe -Content $candidate -ValidateUser $UserName -GuestAddress $GuestAddress)
+        Assert-CageEffectiveConfig $effective $UserName $GuestAddress
+        $user.psbase.RefreshCache(@('UserFlags'))
+        if ([int]$user.UserFlags.Value -ne $beforeFlags) { throw 'Account flags changed during preflight; no installation performed.' }
+        if ([IO.File]::ReadAllText($configPath) -cne $oldConfig) { throw 'Active sshd config changed during preflight; no installation performed.' }
+        Write-Host 'SYSTEM preflight passed: candidate syntax and actual target-user policy verified; temporary validation task/files cleaned.'
+    } else {
+        Write-Warning 'STATIC checks passed only: target account does not exist, so SYSTEM user-context validation is deferred until apply creates it disabled.'
+    }
+    Write-Host 'No accounts, keys, active SSH configuration, firewall or services changed by this preflight.'
     Write-Host ("Plan: {0} standard local user {1}; preserve existing password; ensure Users membership by SID." -f $(if ($resumed) { 'explicitly recover disabled' } elseif ($exists) { 'reuse' } else { 'create' }), $UserName)
     if ($resumed) { Write-Host 'Recovery consent: description is not cryptographic provenance; account stays disabled until all validation succeeds.' }
-    Write-Host 'Plan: install compatible source-restricted key with SID ACL; transactionally validate/install SSH rules and restart sshd.'
+    Write-Host 'Plan: install compatible source-restricted key with SID ACL; SYSTEM-validate/install SSH rules and restart sshd.'
     Write-Host 'No firewall, VPN, broker or administrator membership changes are planned.'
-    Write-Host 'sshd candidate syntax/effective-policy validation requires apply; no temporary config was written in CheckOnly.'
     return
 }
 $created = $false
@@ -364,7 +383,10 @@ try {
     $actual = Get-Acl -LiteralPath $keyFile
     Assert-PeerKeyAcl -Actual $actual -Expected (New-CageKeyAcl $userSid)
     if ([IO.File]::ReadAllText($configPath) -cne $oldConfig) { throw 'sshd config changed during enrollment; rerun preflight.' }
-    Set-CageSshConfig -Path $configPath -Content $candidate -SshdExe $sshdExe -ValidateUser $UserName -GuestAddress $GuestAddress
+    Set-CageSshConfig -Path $configPath -Content $candidate -SshdExe $sshdExe -ValidateUser $UserName -GuestAddress $GuestAddress -EffectiveValidator {
+        param($ValidationContent, $ValidationUser, $ValidationAddress)
+        Invoke-CageSshdSystemValidation -SshdExe $SshdExe -Content $ValidationContent -ValidateUser $ValidationUser -GuestAddress $ValidationAddress
+    }
     if ((Get-Service -Name sshd -ErrorAction Stop).Status -ne 'Running') { throw 'sshd is not running after restart.' }
     Write-Host 'Public SSH host key (independently verify/pin before connecting):'
     # Read ONLY the public host key; never inspect or print private key material.

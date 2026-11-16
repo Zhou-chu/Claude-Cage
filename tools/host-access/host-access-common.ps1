@@ -103,7 +103,8 @@ function Assert-CageEffectiveConfig {
 }
 
 function Set-CageSshConfig {
-    param([string]$Path, [string]$Content, [string]$SshdExe, [string]$ValidateUser, [string]$GuestAddress)
+    param([string]$Path, [string]$Content, [string]$SshdExe, [string]$ValidateUser, [string]$GuestAddress, [scriptblock]$EffectiveValidator)
+    if ($EffectiveValidator -and -not $ValidateUser) { throw 'An effective-validator callback requires an explicit target user.' }
     $original = [IO.File]::ReadAllBytes($Path)
     $candidate = $Path + '.cage-' + [guid]::NewGuid().ToString('N')
     # Write a candidate in the same protected directory. It contains config, not credentials.
@@ -112,9 +113,17 @@ function Set-CageSshConfig {
         Set-Acl -LiteralPath $candidate -AclObject (Get-Acl -LiteralPath $Path)
         Invoke-CageNative $SshdExe @('-t', '-f', $candidate)
         if ($ValidateUser) {
-            $effective = @(& $SshdExe -T -f $candidate -C "user=$ValidateUser,host=cage-guest,addr=$GuestAddress")
-            if ($LASTEXITCODE -ne 0) { throw 'Cannot evaluate candidate sshd user context.' }
+            if ($EffectiveValidator) {
+                # The callback receives immutable candidate content, never a user-writable script.
+                $effective = @(& $EffectiveValidator $Content $ValidateUser $GuestAddress)
+            } else {
+                $effective = @(& $SshdExe -T -f $candidate -C "user=$ValidateUser,host=cage-guest,addr=$GuestAddress")
+                if ($LASTEXITCODE -ne 0) { throw 'Cannot evaluate candidate sshd user context.' }
+            }
             Assert-CageEffectiveConfig $effective $ValidateUser $GuestAddress
+        }
+        if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) -cne [Convert]::ToBase64String($original)) {
+            throw 'Active sshd config changed during candidate validation; no config installed.'
         }
         if (-not (Test-Path -LiteralPath ($Path + '.cage-bak'))) { [IO.File]::WriteAllBytes(($Path + '.cage-bak'), $original) }
         try {
