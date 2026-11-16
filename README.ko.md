@@ -6,9 +6,11 @@
 
 <img src="assets/claude-cage-character.png" alt="Claude Cage" width="320" />
 
-[![Release](https://img.shields.io/github/v/release/Lee-xeo/Claude-Cage?include_prereleases)](https://github.com/Lee-xeo/Claude-Cage/releases) [![CI](https://github.com/Lee-xeo/Claude-Cage/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lee-xeo/Claude-Cage/actions/workflows/ci.yml) [![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Lee-xeo/Claude-Cage?include_prereleases)](https://github.com/Lee-xeo/Claude-Cage/releases) [![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/daily?language=Go" alt="Trendshift — Go Repository of the Day" width="250" height="55" /></a> <a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/weekly?language=Go" alt="Trendshift — Go Repository of the Week" width="250" height="55" /></a>
+
+<a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/daily" alt="Trendshift — Repository of the Day" width="250" height="55" /></a> <a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/weekly" alt="Trendshift — Repository of the Week" width="250" height="55" /></a>
 
 **[프로젝트 웹사이트](https://claude-cage.com/) · [앱 다운로드](https://claude-cage.com/ko/#download) · [시작하기](docs/getting-started.md) · [FAQ](docs/troubleshooting.md) · [사용 문서 (중국어)](https://claude-cage.com/docs/)**
 
@@ -56,7 +58,7 @@ Claude Cage는 터미널, 브라우저, 편집기와 공식 Claude Desktop을 �
 이 요청을 AI 에이전트(codex, dsh, workbuddy — Claude Code는 아닐 수도 있음 😁) 에 보냅니다.
 
 ```markdown
-설치 도와주세요 https://github.com/Lee-xeo/Claude-Cage 로컬 Clash 설치에서 xxx 엔드포인트를 사용하도록 Cage의 네트워크 프록시를 구성합니다.
+https://github.com/Lee-xeo/Claude-Cage의 최신 소스 코드를 받아 빌드하고 패키징해 설치해 줘. Cage 프록시가 내 로컬 Clash의 xx 노드를 통해 내 xx IP로 나가도록 설정해 줘. 전체 과정을 지켜보며 문제가 생기면 직접 수정하고, 필요하면 호환성 개선을 위해 프로젝트에 issue도 제출해 줘.
 ```
 
 필요한 것은 안정적인 네트워크 프록시 엔드포인트뿐입니다. 이 프로젝트는 프록시 공급자를 홍보하지 않습니다. 예를 들어 Black Error 웹사이트를 검색하여 제공자를 직접 찾을 수 있습니다.
@@ -116,8 +118,13 @@ macOS와 서명된 Windows 버전은 선택한 프록시를 통해 업데이트�
 이 프로젝트는 빠르게 발전하고 있습니다. 피드백을 공유하려면 커뮤니티 그룹에 가입하세요. 커뮤니티 관리자를 환영합니다.
 
 <p align="center">
-  <a href="assets/community-qq.png"><img src="assets/community-qq.png" alt="QQ group · 782087179" width="240" /></a>
-  <br />QQ group · 782087179
+  <a href="assets/community-qq.png"><img src="assets/community-qq.png" alt="QQ group · 710792821" width="240" /></a>
+  <br />QQ group · 710792821
+</p>
+
+<p align="center">
+  <a href="assets/community-wechat.png"><img src="assets/community-wechat.png" alt="WeChat" width="240" /></a>
+  <br />WeChat
 </p>
 
 ## 원산지 및 라이선스
@@ -141,6 +148,7 @@ Cage는 독립적인 커뮤니티 프로젝트이며 Anthropic과 관련이 없�
 - [code-server](https://github.com/coder/code-server): 브라우저 기반 코드 편집기입니다.
 - [AIO Sandbox](https://github.com/agent-infra/sandbox): 작업 환경 및 인터랙션 디자인에 대한 참고 자료입니다.
 - [claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 그리고 [Claude-Guardian](https://github.com/DUNHKpcc/Claude-Guardian): 네트워크 점검 및 보안 진단을 위한 참고 자료입니다.
+- [claude-post-ban-cleanup](https://github.com/l2461090/claude-post-ban-cleanup): 정확한 목록 확인, 사용자 데이터 보호 및 복구 가능한 캐시 정리 절차 참고. Cage에서 독립적으로 구현했습니다.
 
 
 <a href="https://www.star-history.com/?repos=Lee-xeo%2FClaude-Cage&amp;type=date">

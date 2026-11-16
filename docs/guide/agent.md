@@ -84,7 +84,7 @@ cage agent call account.unlock --input -
 
 ### 导入代理并确认出口
 
-先读 `proxy.status`。已有可用来源时复用，避免重复导入。首次导入可用用户提供的订阅链接，也可用私有文件中的 Clash/Mihomo 配置或分享链接。
+先读 `proxy.status`。已有可用来源时复用，避免重复导入。首次导入可用用户提供的 HTTPS Clash/Mihomo 节点订阅，或私有文件中的 Clash/Mihomo YAML；内容必须包含 `proxies` 或 `payload` 节点。Base64 列表、单个 `vless://` 等分享链接、Xray/v2rayN 原生 JSON 和仅引用远程 provider 的配置不能直接导入，改文件后缀也不能完成转换。只有分享链接时，先从原客户端导出兼容 YAML；协议或握手不兼容时，可按[通过本机代理客户端转发](network.md#通过本机代理客户端转发)配置 SOCKS5 上游，再验证预期出口。
 
 ```json
 {"name":"我的代理","url":"https://用户自己的订阅地址","interval_hours":0,"host_download":true}
@@ -97,6 +97,22 @@ cage agent call proxy.status
 
 `host_download:true` 明确允许主机联网下载这份订阅，仅用于订阅获取；客机不会因此获得直连回退。已有 Cage 代理时，可省略它让订阅经过现有代理。不要自动从本机浏览器、代理软件或其他 Agent 的凭据文件提取订阅。
 
+从本地 YAML 文件导入时，CLI 仍接收 JSON，YAML 原文放入 `content` 字段。可用 Node.js 读取私有文件并直接通过管道传入，避免将节点内容拼到命令行参数中：
+
+```sh
+node --input-type=module -e '
+import { readFileSync } from "node:fs";
+process.stdout.write(JSON.stringify({
+  name: "我的代理",
+  content: readFileSync(process.argv[1], "utf8")
+}));
+' /private/path/nodes.yaml |
+  cage agent call proxy.import --input - --wait 2m
+cage agent call proxy.status
+```
+
+节点内容使用网络指南中的[完整 SOCKS5 YAML 示例](network.md#通过本机代理客户端转发)或用户自己的兼容配置；不要将 YAML 文件直接作为 `--input` 的 JSON 输入。两种导入方式择一使用，避免重复创建来源。
+
 从返回的来源和节点列表选择用户要求的出口；不要把订阅中的第一个节点当成用户已经同意的出口。
 
 ```json
@@ -108,7 +124,11 @@ cage agent call proxy.select --input /private/path/selection.json --wait 2m
 cage agent call proxy.status
 ```
 
-链式代理使用 `proxy.route`，输入 `{"node_ids":["入口ID","最终出口ID"]}`，顺序为入口到出口。更新订阅使用 `proxy.refresh` 和已有来源 `id`；`proxy.import` 每次创建来源，不能盲目重试。成功应用代理只表示代理已准备好，客机启动后的安全检查还需单独验证。
+链式代理使用 `proxy.route`，输入 `{"node_ids":["入口ID","最终出口ID"]}`，顺序为入口到出口。`proxy.select` 总是把路由替换为所选的单个节点：已有链会被清除，所选节点即使原本在链中也可以。节点无效、配置验证或核心启动失败时保留原路由；路由保存后的网络检查仍可能失败，应以 `proxy.status` 返回的当前路由为准。要保留或重建多跳链，请重新调用 `proxy.route`。更新订阅使用 `proxy.refresh` 和已有来源 `id`；`proxy.import` 每次创建来源，不能盲目重试。
+
+`proxy.import` 成功表示节点格式和核心配置通过校验。应用节点后，用 `settings.get` 读取完整设置，再将设置对象作为 `settings.probe` 的输入，通过所选代理发起真实 HTTPS 请求，核对返回的出口 IP 和位置。报告时分别说明导入校验、实际连通性与出口验证结果；主机上其他代理客户端可用或核心进程正在运行，都不能代替实际出口验证。客机启动后，仍需按下文核对 `network.check` 和当前网络授权，确认终端与浏览器等路径通过检查。
+
+VLESS + TCP + REALITY 节点若在语法校验通过后报 `REALITY authentication failed`，先对照原客户端与服务端参数，再按[网络指南的 REALITY 排查步骤](network.md#vless-reality-握手失败)检查 `reality-opts.support-x25519mlkem768`。按节点要求只调整这一项，重新导入、应用并重复相同的 HTTPS 与出口验证；不要批量改写所有 REALITY 节点、关闭证书校验或绕过出口规则。节点地址、UUID、公钥、short-id 和原始日志仍应留在私有排查材料中。
 
 ### 准备环境并打开项目
 
@@ -152,6 +172,8 @@ cage agent call network.check --wait 5m
 打开项目使用 `project.open`：`{"workspace":"用户授权的绝对路径","add":true,"activate":true}`。它会让客机访问这个目录，改动会影响主机文件。返回 `approval` 表示等待系统授权；Agent 可以调用相同的 `/api/macos/project-approval` 查看、操作该窗口。Claude 的服务登录仍在 Cage 内的官方工具中完成；本接口不会导入主机 Claude 凭据。
 
 移除已添加项目使用 `project.remove`，传入 `{"workspace":"项目列表中的路径"}`。关闭该目录的终端、运行中会话和编辑器后可解除共享，原文件与会话历史保留。移除当前项目后切换到剩余项目；移除最后一个项目后没有当前项目。
+
+Linux 环境默认缓存项目文件的名称与属性，主机上的改动最多 20 秒后可见。刚在主机上改过文件、需要环境立即看到时调用 `project.refresh`，无需参数；macOS 和 Windows 环境始终直接读取，调用会返回 409。
 
 ## JSON 结果和异步任务
 
@@ -243,7 +265,6 @@ cage agent call settings.get --scope selected --connection 当前连接代次
 | 名称、头像、密码、锁定、退出 | account.profile：username/avatar；account.password：old_password/password/confirm_password；account.lock/logout/suspend。 |
 | 本机信任、记住登录、设置密码保护 | desktop 范围 client.trusted-login：action 为 create/resume/enable/disable/protect，按同一规则提供 password、connection_id。 |
 | Touch ID 与快捷登录 | native.submit 提交 accountDevice，operation 为 status/enable/disable/unlock，kind 为 automatic/biometric；设备密钥由原生安全存储管理。Windows/Linux 不支持的操作与用户界面返回相同限制。 |
-| 首次启动的 Git 保护 | host.git 读取，host.git.enable 输入 confirm:true 启用；会修改主机全局 Git 保护配置，与界面动作相同。 |
 | 外观、字体、配色、自定义主题 | appearance.get/set 读写完整对象，appearance.codex 读取本机 Codex 外观导入；读取后保留未修改字段。 |
 | 出口位置检测、测速、连接和日志 | settings.probe 输入完整设置草稿；proxy.delay 输入 node_id；proxy.connections/logs。dry_run 仅静态校验。 |
 | 尚未开始安装时重选系统 | guest.reselect 输入 guest.options.pending.id，仍由原安装状态约束。 |

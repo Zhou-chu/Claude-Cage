@@ -6,9 +6,11 @@
 
 <img src="assets/claude-cage-character.png" alt="Claude Cage" width="320" />
 
-[![Release](https://img.shields.io/github/v/release/Lee-xeo/Claude-Cage?include_prereleases)](https://github.com/Lee-xeo/Claude-Cage/releases) [![CI](https://github.com/Lee-xeo/Claude-Cage/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Lee-xeo/Claude-Cage/actions/workflows/ci.yml) [![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/Lee-xeo/Claude-Cage?include_prereleases)](https://github.com/Lee-xeo/Claude-Cage/releases) [![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
 <a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/daily?language=Go" alt="Trendshift — Go Repository of the Day" width="250" height="55" /></a> <a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/weekly?language=Go" alt="Trendshift — Go Repository of the Week" width="250" height="55" /></a>
+
+<a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/daily" alt="Trendshift — Repository of the Day" width="250" height="55" /></a> <a href="https://trendshift.io/repositories/339051#achievements"><img src="https://trendshift.io/api/badge/trendshift/repositories/339051/weekly" alt="Trendshift — Repository of the Week" width="250" height="55" /></a>
 
 **[Сайт проекта](https://claude-cage.com/) · [Скачать приложение](https://claude-cage.com/ru/#download) · [Начало работы](docs/getting-started.md) · [Часто задаваемые вопросы](docs/troubleshooting.md) · [Руководство (на китайском)](https://claude-cage.com/docs/)**
 
@@ -56,7 +58,7 @@ Claude Cage объединяет терминал, браузер, редакт�
 Отправьте этот запрос своему ИИ-агенту (codex, dsh, workbuddy — вероятно, не Claude Code 😁):
 
 ```markdown
-Помогите мне установить https://github.com/Lee-xeo/Claude-Cage и настройте сетевой прокси-сервер Cage для использования конечной точки xxx в моей локальной установке Clash.
+Получи последнюю версию исходного кода https://github.com/Lee-xeo/Claude-Cage, собери пакет и установи его. Настрой прокси Cage так, чтобы он использовал узел xx локального Clash и выходил через мой IP xx. Следи за всем процессом, сразу исправляй проблемы и при необходимости создай issue в проекте, чтобы помочь улучшить совместимость.
 ```
 
 Все, что вам нужно, — это надежная конечная точка сетевого прокси. Этот проект не продвигает какого-либо прокси-провайдера; Вы можете найти провайдера самостоятельно, например, выполнив поиск на сайте Black Error.
@@ -116,8 +118,13 @@ macOS и подписанные версии Windows обновляются че
 Проект быстро развивается. Присоединяйтесь к группе сообщества, чтобы поделиться отзывами; сопровождающие сообщества приветствуются.
 
 <p align="center">
-  <a href="assets/community-qq.png"><img src="assets/community-qq.png" alt="QQ group · 782087179" width="240" /></a>
-  <br />QQ group · 782087179
+  <a href="assets/community-qq.png"><img src="assets/community-qq.png" alt="QQ group · 710792821" width="240" /></a>
+  <br />QQ group · 710792821
+</p>
+
+<p align="center">
+  <a href="assets/community-wechat.png"><img src="assets/community-wechat.png" alt="WeChat" width="240" /></a>
+  <br />WeChat
 </p>
 
 ## Происхождение и лицензирование
@@ -141,6 +148,7 @@ Cage — это независимый общественный проект, н
 - [code-server](https://github.com/coder/code-server): редактор кода на основе браузера.
 - [AIO Sandbox](https://github.com/agent-infra/sandbox): ссылки на рабочую среду и дизайн взаимодействия.
 - [claude-switcher](https://github.com/YOURSJEYO/claude-switcher) и [Claude-Guardian](https://github.com/DUNHKpcc/Claude-Guardian): ссылки для проверки сети и диагностики безопасности.
+- [claude-post-ban-cleanup](https://github.com/l2461090/claude-post-ban-cleanup): пример точной инвентаризации, защиты данных и очистки кэша с восстановлением; независимая реализация в Cage.
 
 
 <a href="https://www.star-history.com/?repos=Lee-xeo%2FClaude-Cage&amp;type=date">

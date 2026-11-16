@@ -11,7 +11,7 @@ internal static class UpdateInstaller
     public static void VerifyArchive(string path, string hash, string version, string publisher)
     {
         UpdatePolicy.DownloadPath(path, AppUpdater.Root); UpdatePolicy.PlainPath(path);
-        if (new FileInfo(path).Length is <= 0 or > (512L << 20)) throw new IOException("安装包大小无效");
+        if (new FileInfo(path).Length is <= 0 or > (2L << 30)) throw new IOException("安装包大小无效");
         using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         var actual = Convert.ToHexString(SHA256.HashData(stream));
         if (hash.Length != 64 || !string.Equals(actual, hash, StringComparison.OrdinalIgnoreCase))
@@ -22,7 +22,7 @@ internal static class UpdateInstaller
             throw new IOException("安装包产品身份或版本不匹配");
     }
 
-    public static async Task<int> Run()
+    public static async Task<int> Run(string? installerDiagnostics = null)
     {
         InstallPlan? plan = null;
         string? backup = null;
@@ -73,16 +73,17 @@ internal static class UpdateInstaller
             VerifyArchive(plan.Archive, plan.Digest, plan.Version, ownPublisher);
             // NSIS requires /D= to be the final, unquoted argument; the executable
             // path is passed separately and no command shell is involved.
+            var diagnosticOption = installerDiagnostics == null ? "" : $"/DIAGNOSTICS=\"{installerDiagnostics}\" ";
             using (var installer = Process.Start(new ProcessStartInfo(plan.Archive) {
                 UseShellExecute = false, CreateNoWindow = true,
-                Arguments = "/S /UPDATE /D=" + plan.Target,
+                Arguments = "/S /UPDATE " + diagnosticOption + "/D=" + plan.Target,
                 WorkingDirectory = Path.GetDirectoryName(plan.Archive),
             }) ?? throw new IOException("无法启动 Windows 安装器"))
             {
                 installerStarted = true;
                 try { await installer.WaitForExitAsync().WaitAsync(TimeSpan.FromMinutes(10)); }
                 catch (TimeoutException) { if (!installer.HasExited) installer.Kill(true); await installer.WaitForExitAsync(); throw; }
-                if (installer.ExitCode != 0) throw new IOException("Windows 安装程序未完成安装");
+                if (installer.ExitCode != 0) throw new IOException($"Windows 安装程序未完成安装（退出码 {installer.ExitCode}）");
             }
             EnsureInstallationComplete(plan.Target);
             Authenticode.SamePublisher(original, ownPublisher);
@@ -150,16 +151,18 @@ internal static class UpdateInstaller
                     CopyTree(backup, restored);
                     var receipt = plan.Target + ".cage-installation.json";
                     await PreserveFiles("prepare", plan.Target, restored, receipt, failed);
-                    Directory.Move(plan.Target, failed);
+                    // The installation folder and its CageData stay in place,
+                    // as in NSIS: only the other top-level entries move.
+                    await PreserveFiles("detach", plan.Target, failed, receipt);
                     try
                     {
                         await PreserveFiles("move", failed, restored, receipt);
-                        Directory.Move(restored, plan.Target);
+                        await PreserveFiles("attach", restored, plan.Target, receipt);
                     }
                     catch
                     {
                         await PreserveFiles("restore", restored, failed, receipt);
-                        Directory.Move(failed, plan.Target);
+                        await PreserveFiles("attach", failed, plan.Target, receipt);
                         await PreserveFiles("complete", "", plan.Target, receipt);
                         throw;
                     }
@@ -237,7 +240,7 @@ internal static class UpdateInstaller
             using var deadline = new CancellationTokenSource(TimeSpan.FromMinutes(10));
             var executable = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "WindowsPowerShell", "v1.0", "powershell.exe");
             var arguments = new List<string> { "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", script,
-                "-Operation", operation, "-Source", source, "-Target", target, "-Receipt", receipt, "-LegacyTarget" };
+                "-Operation", operation, "-Source", source, "-Target", target, "-Receipt", receipt, "-LegacyTarget", "-KeepInPlace", "CageData" };
             if (backupPath != null) { arguments.Add("-Backup"); arguments.Add(backupPath); }
             using var process = new Process { StartInfo = Backend.StartInfo(executable, arguments.ToArray()) };
             if (!process.Start()) throw new IOException("无法启动安装文件保留组件");
