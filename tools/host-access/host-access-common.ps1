@@ -102,8 +102,24 @@ function Assert-CageEffectiveConfig {
     if ($Effective -notcontains $expected) { throw 'Effective dedicated key path was overridden; no config installed.' }
 }
 
+function Test-CageConfigSyntax {
+    param([string]$SshdExe, [string]$Path, [switch]$Bounded)
+    if ($Bounded) {
+        $result = Invoke-CageSsvNative $SshdExe @('-t','-f',$Path) 10
+        if (-not (Test-CageSsvNativeSuccess $result)) {
+            $failure = New-Object InvalidOperationException('Bounded native syntax validation failed.')
+            if (-not $result.Stopped) { $failure.Data['CageNativeUnproven'] = $true }
+            throw $failure
+        }
+    } else { Invoke-CageNative $SshdExe @('-t','-f',$Path) }
+}
+
 function Set-CageSshConfig {
-    param([string]$Path, [string]$Content, [string]$SshdExe, [string]$ValidateUser, [string]$GuestAddress, [scriptblock]$EffectiveValidator)
+    param([string]$Path, [string]$Content, [string]$SshdExe, [string]$ValidateUser, [string]$GuestAddress, [scriptblock]$EffectiveValidator, [switch]$KeepServiceStopped)
+    if ($KeepServiceStopped) {
+        if ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value -cne 'S-1-5-18') { throw 'Deferred service start requires actual SYSTEM identity.' }
+        if ((Get-Service sshd -ErrorAction Stop).Status -ne 'Stopped') { throw 'Deferred service start requires sshd already stopped.' }
+    }
     if ($EffectiveValidator -and -not $ValidateUser) { throw 'An effective-validator callback requires an explicit target user.' }
     $original = [IO.File]::ReadAllBytes($Path)
     $candidate = $Path + '.cage-' + [guid]::NewGuid().ToString('N')
@@ -111,7 +127,7 @@ function Set-CageSshConfig {
     try {
         [IO.File]::WriteAllText($candidate, $Content, (New-Object Text.UTF8Encoding($false)))
         Set-Acl -LiteralPath $candidate -AclObject (Get-Acl -LiteralPath $Path)
-        Invoke-CageNative $SshdExe @('-t', '-f', $candidate)
+        Test-CageConfigSyntax $SshdExe $candidate -Bounded:$KeepServiceStopped
         if ($ValidateUser) {
             if ($EffectiveValidator) {
                 # The callback receives immutable candidate content, never a user-writable script.
@@ -125,13 +141,21 @@ function Set-CageSshConfig {
         if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) -cne [Convert]::ToBase64String($original)) {
             throw 'Active sshd config changed during candidate validation; no config installed.'
         }
+        if ($KeepServiceStopped -and (Get-Service sshd -ErrorAction Stop).Status -ne 'Stopped') { throw 'sshd restarted during isolated validation; no config installed.' }
         if (-not (Test-Path -LiteralPath ($Path + '.cage-bak'))) { [IO.File]::WriteAllBytes(($Path + '.cage-bak'), $original) }
+        $installed = $false
         try {
             [IO.File]::WriteAllText($Path, $Content, (New-Object Text.UTF8Encoding($false)))
-            Invoke-CageNative $SshdExe @('-t', '-f', $Path)
-            Restart-Service sshd -ErrorAction Stop
+            $installed = $true
+            Test-CageConfigSyntax $SshdExe $Path -Bounded:$KeepServiceStopped
+            if (-not $KeepServiceStopped) { Restart-Service sshd -ErrorAction Stop }
         } catch {
-            [IO.File]::WriteAllBytes($Path, $original)
+            if ($KeepServiceStopped) { throw } # Outer maintenance must disable the account BEFORE restoration.
+            if ($installed) {
+                $expectedBytes = [Text.Encoding]::UTF8.GetBytes($Content)
+                if ([Convert]::ToBase64String([IO.File]::ReadAllBytes($Path)) -cne [Convert]::ToBase64String($expectedBytes)) { throw 'Active config changed after installation; refusing to overwrite an external update.' }
+                [IO.File]::WriteAllBytes($Path, $original)
+            }
             throw
         }
     } finally {

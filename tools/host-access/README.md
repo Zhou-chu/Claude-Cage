@@ -96,6 +96,38 @@ Windows管理员不等于SYSTEM，不能直接以自身身份让sshd取得另一
 
 本人从目标电脑回传并核对公开主机键后，才能固定到独立known_hosts、配置该设备的客户端配置并登记MCP目标，再实测非管理员SSH。不要将台式机审批令牌复用到其他设备；无审批代理的SSH专用配置应使用独立不存在的broker令牌路径，使误调用代理失败。在线、端口可达、脚本单元测试通过均不等于真实设备授权已完成。
 
+## 禁用账号拒绝S4U时的隔离维护
+
+部分Windows环境在账号仍禁用时，即便真实SYSTEM也会拒绝生成用户令牌。不要把管理员令牌、全局`sshd -T`、假用户或单元测试当作目标用户的有效配置证明，也不要直接启用账号后再修改正在监听的服务。
+
+[peer-maintenance.ps1](./peer-maintenance.ps1)提供单独的SYSTEM维护事务：核对机器名、原SID、标准组、公钥ACL及配置/公钥哈希；保存精确原字节；停sshd并证明无残留监听后才临时启用；真实验证目标用户的七项策略，在保持停服的情况下安装，再启动验证。任何失败先隔离、禁用并确认原SID，再按原字节恢复；发现外部配置修改、禁用失败或原生进程终止未证明时拒绝恢复服务。它不改密码、公钥或组成员，不是通用管理员执行入口。
+
+[invoke-laptop-maintenance.ps1](./invoke-laptop-maintenance.ps1)是当前已授权笔记本的**操作者专用、固定设备快照**入口，不属于Cage/MCP能力，不能不经审查套用于其他机器。它利用宿主既有管理员SSH身份，严格核对主机键；通过SFTP传送仅含公开代码/元数据的封装，短入口校验同一份内存字节的哈希后解析，避免Windows大标准输入/命令行封装问题。SYSTEM只加载ProgramData中具有固定哈希、SYSTEM/Administrators保护ACL的代码，不从用户可写桌面执行。先跑不改账号/服务的SYSTEM探针，再登记独立的限时主任务和回滚任务。
+
+```powershell
+# 仅供已获授权的宿主操作者；同一批操作始终使用同一个唯一state路径。
+$state = Join-Path $PWD.Path '.test-output\peer-maintenance-unique.json'
+.\invoke-laptop-maintenance.ps1 -Action Prepare -StatePath $state
+.\invoke-laptop-maintenance.ps1 -Action Probe -StatePath $state
+.\invoke-laptop-maintenance.ps1 -Action Collect -StatePath $state
+# 仅在真实探针成功且快照未变后启动一次；保持笔记本唤醒、联网。
+.\invoke-laptop-maintenance.ps1 -Action Start -StatePath $state
+# 连接中断或结果未知时只收取，绝不重复Start。
+.\invoke-laptop-maintenance.ps1 -Action Collect -StatePath $state
+```
+
+维护任务有短时、线程寿命内的防自动休眠请求，不改电源计划，也不能阻止本人强制睡眠。受保护轨迹用于定位中断；原生收据仅保留状态、脱敏令牌错误标记及七项策略。超时/离线不等于成功；只有原SID已禁用、原配置哈希恢复且服务运行的收据与新鲜状态一致，才可认定安全回滚。终止不明时保留任务/目录，由本人管理员处理。已成功接入的账号会被恢复前置条件拒绝，不能反复重跑。确认结论后使用`-Action Cleanup`移除仅属于该state且动作/主体匹配、已结束的任务；审计目录仍保留，不发布轨迹或本机state。
+
+[install-laptop-guest-access.ps1](./install-laptop-guest-access.ps1)只接受真实维护成功收据及新鲜状态，通过已认证管理员SSH取得公开Ed25519主机键、重新计算指纹，并写入独立0600主机键文件/客户端配置，保留原目标。笔记本只有标准用户SSH权限，不复制或共享台式机审批令牌。之后以相同`-StatePath`运行[verify-guest-laptop.ps1](./verify-guest-laptop.ps1)，通过新启动的真实MCP stdio会话检验笔记本非管理员身份、远程退出码、未登记目标执行前拒绝及原桌面目标回归。目标表在每次工具调用时重新读取；新增目标不必重启已有桥接进程。该验收仍不冒充Desktop应用界面的实际工具调用。
+
+```powershell
+.\install-laptop-guest-access.ps1 -StatePath $state
+.\verify-guest-laptop.ps1 -StatePath $state
+.\invoke-laptop-maintenance.ps1 -Action Cleanup -StatePath $state
+# 纯隔离回归：不执行真实账号/服务/任务操作。
+powershell -NoProfile -ExecutionPolicy Bypass -File .\test-peer-maintenance.ps1
+```
+
 ## 审批与失败语义
 
 `health`只验证鉴权和可达性，不弹窗、不执行命令。`run`才提交一次`{command,reason}`。取消审批不执行；UAC取消或启动失败不等于成功；返回退出码应来自实际子进程。网络在提交后中断可能产生**执行结果未知**，禁止自动重投。输出/HTTP响应受大小限制。
